@@ -92,21 +92,30 @@ def tesseract_psm_candidates() -> list[str]:
 
 
 def tesseract_max_variants() -> int:
-    raw = os.environ.get("TESSERACT_MAX_VARIANTS", "4").strip()
+    raw = os.environ.get("TESSERACT_MAX_VARIANTS", "3").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 4
+        value = 3
     return max(1, min(value, 12))
 
 
 def tesseract_call_timeout_sec() -> float:
-    raw = os.environ.get("TESSERACT_CALL_TIMEOUT_SEC", "12").strip()
+    raw = os.environ.get("TESSERACT_CALL_TIMEOUT_SEC", "8").strip()
     try:
         value = float(raw)
     except ValueError:
-        value = 12.0
+        value = 8.0
     return max(2.0, min(value, 60.0))
+
+
+def tesseract_max_attempts() -> int:
+    raw = os.environ.get("TESSERACT_MAX_ATTEMPTS", "4").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 4
+    return max(1, min(value, 20))
 
 
 def make_supabase_client() -> Client:
@@ -315,11 +324,12 @@ def _build_tesseract_image_variants(image: Any) -> list[tuple[str, Any]]:
         return [("raw", image)]
 
     gray = image.convert("L")
-    variants: list[tuple[str, Any]] = [("gray", gray)]
+    variants: list[tuple[str, Any]] = []
 
     auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
     variants.append(("gray_auto", auto))
     variants.append(("binary_auto", _binarize_luma(auto)))
+    variants.append(("gray", gray))
 
     if ImageFilter is not None:
         denoised = auto.filter(ImageFilter.MedianFilter(size=3))
@@ -457,23 +467,30 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                 best_score = -1e9
                 best_variant: Any | None = None
                 best_psm = psm_candidates[0] if psm_candidates else "6"
-                stop_early = False
 
-                for _, variant in _build_tesseract_image_variants(image):
-                    for psm in psm_candidates:
-                        candidate_text, candidate_conf = _run_tesseract_candidate(
-                            variant, lang, psm
-                        )
-                        score = _ocr_candidate_score(candidate_text, candidate_conf)
-                        if score > best_score:
-                            best_score = score
-                            best_text = candidate_text
-                            best_variant = variant
-                            best_psm = psm
-                        if _ocr_candidate_good_enough(candidate_text, candidate_conf):
-                            stop_early = True
-                            break
-                    if stop_early:
+                variants = _build_tesseract_image_variants(image)
+                attempts: list[tuple[Any, str]] = []
+                if psm_candidates:
+                    primary_psm = psm_candidates[0]
+                    for _, variant in variants:
+                        attempts.append((variant, primary_psm))
+                    for extra_psm in psm_candidates[1:]:
+                        for _, variant in variants[:2]:
+                            attempts.append((variant, extra_psm))
+
+                attempts = attempts[: tesseract_max_attempts()]
+
+                for variant, psm in attempts:
+                    candidate_text, candidate_conf = _run_tesseract_candidate(
+                        variant, lang, psm
+                    )
+                    score = _ocr_candidate_score(candidate_text, candidate_conf)
+                    if score > best_score:
+                        best_score = score
+                        best_text = candidate_text
+                        best_variant = variant
+                        best_psm = psm
+                    if _ocr_candidate_good_enough(candidate_text, candidate_conf):
                         break
 
                 if not best_text.strip():
