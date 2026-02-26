@@ -613,6 +613,7 @@ def _tesseract_config(psm: str) -> str:
         f"--oem {tesseract_oem()}",
         f"--psm {psm}",
         "-c preserve_interword_spaces=1",
+        f"-c user_defined_dpi={tesseract_dpi()}",
     ]
     tessdata_dir = str(info.get("tessdata_dir") or "").strip()
     if tessdata_dir:
