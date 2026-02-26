@@ -580,10 +580,10 @@ def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
         (mean_confidence * 4.0)
         + float(text_len)
         + float(word_count * 2)
-        + float(turkish_hits * 8)
+        + float(turkish_hits * 20)
         - float(replacement_hits * 25)
         - float(symbol_noise * 4)
-        - float(question_marks * 3)
+        - float(question_marks * 15)
     )
 
 
@@ -595,6 +595,15 @@ def _ocr_candidate_good_enough(text: str, mean_confidence: float) -> bool:
         return True
     turkish_hits = sum(normalized.count(ch) for ch in _TURKISH_CHARS)
     return turkish_hits >= 3 and mean_confidence >= 50
+
+
+def _looks_like_bad_turkish_ocr(text: str) -> bool:
+    normalized = normalize_extracted_text(text)
+    if len(normalized) < 24:
+        return False
+    turkish_hits = sum(normalized.count(ch) for ch in _TURKISH_CHARS)
+    question_marks = normalized.count("?")
+    return turkish_hits == 0 and question_marks >= 3
 
 
 def _tesseract_config(psm: str) -> str:
@@ -739,15 +748,39 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                 raw = best_text
                 final_timeout = min(30.0, tesseract_call_timeout_sec() * 2.0)
 
+                def _pick_better_text(current_text: str, candidate_text: str) -> str:
+                    if not candidate_text.strip():
+                        return current_text
+                    if not current_text.strip():
+                        return candidate_text
+                    current_score = _ocr_candidate_score(current_text, 0.0)
+                    candidate_score = _ocr_candidate_score(candidate_text, 0.0)
+                    return candidate_text if candidate_score > current_score else current_text
+
                 if best_variant is not None:
                     try:
                         pretty = _run_tesseract_final_passes(
                             best_variant, best_psm, final_timeout
                         )
-                        if pretty.strip():
-                            raw = pretty
+                        raw = _pick_better_text(raw, pretty)
                     except Exception:
                         pass
+
+                if _looks_like_bad_turkish_ocr(raw):
+                    for _, alt_variant in variants:
+                        if alt_variant is best_variant:
+                            continue
+                        try:
+                            pretty_alt = _run_tesseract_final_passes(
+                                alt_variant,
+                                best_psm,
+                                final_timeout,
+                            )
+                            raw = _pick_better_text(raw, pretty_alt)
+                            if not _looks_like_bad_turkish_ocr(raw):
+                                break
+                        except Exception:
+                            continue
 
                 if not raw.strip() and attempts:
                     fallback_variant, fallback_psm = attempts[0]
