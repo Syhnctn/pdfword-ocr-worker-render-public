@@ -23,7 +23,7 @@ services:
       - key: TESSERACT_LANG
         value: tur+eng
       - key: TESSERACT_DPI
-        value: "220"
+        value: "180"
       - key: TESSERACT_PSM
         value: "6"
       - key: TESSERACT_OEM

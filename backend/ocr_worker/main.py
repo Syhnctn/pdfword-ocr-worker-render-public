@@ -59,11 +59,11 @@ def tesseract_langs() -> str:
 
 
 def tesseract_dpi() -> int:
-    raw = os.environ.get("TESSERACT_DPI", "220").strip()
+    raw = os.environ.get("TESSERACT_DPI", "180").strip()
     try:
         dpi = int(raw)
     except ValueError:
-        dpi = 220
+        dpi = 180
     return max(96, min(dpi, 600))
 
 
@@ -429,16 +429,6 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
             text = ""
             mean_conf = -1.0
 
-    if not text:
-        try:
-            text = pytesseract.image_to_string(
-                image, lang=lang, config=config, timeout=timeout_sec
-            )
-        except TypeError:
-            text = pytesseract.image_to_string(image, lang=lang, config=config)
-        except Exception:
-            text = ""
-
     return text, mean_conf
 
 
@@ -493,21 +483,50 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                     if _ocr_candidate_good_enough(candidate_text, candidate_conf):
                         break
 
-                if not best_text.strip():
-                    raise RuntimeError("tesseract_ocr_empty_result")
                 raw = best_text
+                final_timeout = min(30.0, tesseract_call_timeout_sec() * 2.0)
+
                 if best_variant is not None:
                     try:
                         pretty = pytesseract.image_to_string(
                             best_variant,
                             lang=lang,
                             config=_tesseract_config(best_psm),
-                            timeout=tesseract_call_timeout_sec(),
+                            timeout=final_timeout,
+                        )
+                        if pretty.strip():
+                            raw = pretty
+                    except TypeError:
+                        pretty = pytesseract.image_to_string(
+                            best_variant,
+                            lang=lang,
+                            config=_tesseract_config(best_psm),
                         )
                         if pretty.strip():
                             raw = pretty
                     except Exception:
                         pass
+
+                if not raw.strip() and attempts:
+                    fallback_variant, fallback_psm = attempts[0]
+                    try:
+                        raw = pytesseract.image_to_string(
+                            fallback_variant,
+                            lang=lang,
+                            config=_tesseract_config(fallback_psm),
+                            timeout=final_timeout,
+                        )
+                    except TypeError:
+                        raw = pytesseract.image_to_string(
+                            fallback_variant,
+                            lang=lang,
+                            config=_tesseract_config(fallback_psm),
+                        )
+                    except Exception:
+                        raw = ""
+
+                if not raw.strip():
+                    raise RuntimeError("tesseract_ocr_empty_result")
             except Exception as exc:  # pragma: no cover - tesseract specific
                 raise RuntimeError(f"tesseract_ocr_failed:{exc}") from exc
             finally:

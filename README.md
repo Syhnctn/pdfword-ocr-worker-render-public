@@ -86,7 +86,7 @@ Worker env vars:
 - `OCR_RESULTS_BUCKET` (default: `ocr-results`)
 - `OPEN_SOURCE_OCR_ENABLED` (default: `true`)
 - `TESSERACT_LANG` (default: `tur+eng`)
-- `TESSERACT_DPI` (default: `220`)
+- `TESSERACT_DPI` (default: `180`)
 - `TESSERACT_PSM` (default: `6`)
 - `TESSERACT_OEM` (default: `1`)
 - `TESSERACT_PSM_CANDIDATES` (default: `6,4`)

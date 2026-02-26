@@ -26,7 +26,7 @@ uvicorn main:app --host 0.0.0.0 --port 8080
 - `OCR_WORKER_SECRET` (if your webhook requires bearer auth)
 - `OPEN_SOURCE_OCR_ENABLED` (default: `true`)
 - `TESSERACT_LANG` (default: `tur+eng`)
-- `TESSERACT_DPI` (default: `220`)
+- `TESSERACT_DPI` (default: `180`)
 - `TESSERACT_PSM` (default: `6`)
 - `TESSERACT_OEM` (default: `1`)
 - `TESSERACT_PSM_CANDIDATES` (default: `6,4`)
