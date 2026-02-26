@@ -1,0 +1,1 @@
+# PDFWord OCR Worker (Render Deploy)`r`n`r`nPublic deploy mirror for Render.

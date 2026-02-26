@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: pdfword-ocr-worker
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./backend/ocr_worker/Dockerfile
+    dockerContext: ./backend/ocr_worker
+    healthCheckPath: /healthz
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OCR_INPUT_BUCKET
+        value: ocr-inputs
+      - key: OCR_RESULTS_BUCKET
+        value: ocr-results
+      - key: OCR_WORKER_SECRET
+        sync: false
+      - key: LIGHTON_OCR_ENDPOINT
+        sync: false
+      - key: LIGHTON_OCR_TOKEN
+        sync: false
