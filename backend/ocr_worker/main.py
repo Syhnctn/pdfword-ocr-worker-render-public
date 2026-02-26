@@ -58,6 +58,24 @@ def tesseract_langs() -> str:
     return value or "tur+eng"
 
 
+def tesseract_final_lang_candidates() -> list[str]:
+    base = tesseract_langs()
+    candidates = [base]
+    if "tur" in base and base != "tur":
+        candidates.insert(0, "tur")
+    if "eng" not in base:
+        candidates.append("eng")
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in candidates:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result or ["tur", "eng"]
+
+
 def tesseract_dpi() -> int:
     raw = os.environ.get("TESSERACT_DPI", "180").strip()
     try:
@@ -363,6 +381,7 @@ def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
     turkish_hits = sum(normalized.count(ch) for ch in _TURKISH_CHARS)
     replacement_hits = normalized.count("\ufffd")
     symbol_noise = normalized.count("|") + normalized.count("~")
+    question_marks = normalized.count("?")
 
     return (
         (mean_confidence * 4.0)
@@ -371,6 +390,7 @@ def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
         + float(turkish_hits * 8)
         - float(replacement_hits * 25)
         - float(symbol_noise * 4)
+        - float(question_marks * 3)
     )
 
 
@@ -432,6 +452,40 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
     return text, mean_conf
 
 
+def _run_tesseract_final_passes(
+    image: Any, psm: str, timeout_sec: float
+) -> str:
+    if pytesseract is None:
+        return ""
+
+    best_text = ""
+    best_score = -1e9
+
+    for lang in tesseract_final_lang_candidates():
+        try:
+            text = pytesseract.image_to_string(
+                image,
+                lang=lang,
+                config=_tesseract_config(psm),
+                timeout=timeout_sec,
+            )
+        except TypeError:
+            text = pytesseract.image_to_string(
+                image,
+                lang=lang,
+                config=_tesseract_config(psm),
+            )
+        except Exception:
+            continue
+
+        score = _ocr_candidate_score(text, 0.0)
+        if score > best_score:
+            best_score = score
+            best_text = text
+
+    return best_text
+
+
 def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int, str]]:
     if fitz is None or pytesseract is None or Image is None:
         raise RuntimeError("open_source_ocr_dependencies_missing")
@@ -488,19 +542,8 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
 
                 if best_variant is not None:
                     try:
-                        pretty = pytesseract.image_to_string(
-                            best_variant,
-                            lang=lang,
-                            config=_tesseract_config(best_psm),
-                            timeout=final_timeout,
-                        )
-                        if pretty.strip():
-                            raw = pretty
-                    except TypeError:
-                        pretty = pytesseract.image_to_string(
-                            best_variant,
-                            lang=lang,
-                            config=_tesseract_config(best_psm),
+                        pretty = _run_tesseract_final_passes(
+                            best_variant, best_psm, final_timeout
                         )
                         if pretty.strip():
                             raw = pretty
@@ -510,17 +553,10 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                 if not raw.strip() and attempts:
                     fallback_variant, fallback_psm = attempts[0]
                     try:
-                        raw = pytesseract.image_to_string(
+                        raw = _run_tesseract_final_passes(
                             fallback_variant,
-                            lang=lang,
-                            config=_tesseract_config(fallback_psm),
-                            timeout=final_timeout,
-                        )
-                    except TypeError:
-                        raw = pytesseract.image_to_string(
-                            fallback_variant,
-                            lang=lang,
-                            config=_tesseract_config(fallback_psm),
+                            fallback_psm,
+                            final_timeout,
                         )
                     except Exception:
                         raw = ""
