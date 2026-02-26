@@ -18,6 +18,14 @@ services:
         value: ocr-results
       - key: OCR_WORKER_SECRET
         sync: false
+      - key: OPEN_SOURCE_OCR_ENABLED
+        value: "true"
+      - key: TESSERACT_LANG
+        value: tur+eng
+      - key: TESSERACT_DPI
+        value: "220"
+      - key: TESSERACT_PSM
+        value: "6"
       - key: LIGHTON_OCR_ENDPOINT
         sync: false
       - key: LIGHTON_OCR_TOKEN

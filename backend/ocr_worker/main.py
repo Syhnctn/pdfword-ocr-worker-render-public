@@ -11,6 +11,18 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from supabase import Client, create_client
 
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover - optional dependency
+    fitz = None
+
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None
+    Image = None
+
 app = FastAPI(title="pdfword-ocr-worker", version="0.2.0")
 
 _BULLET_RE = re.compile(r"^([\-*]|\d+[.)])\s+")
@@ -21,6 +33,36 @@ _HEADING_RE = re.compile(r"^[A-Z0-9][A-Z0-9\s/&()_-]{2,}$")
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def open_source_ocr_enabled() -> bool:
+    return env_flag("OPEN_SOURCE_OCR_ENABLED", True)
+
+
+def tesseract_langs() -> str:
+    value = os.environ.get("TESSERACT_LANG", "tur+eng").strip()
+    return value or "tur+eng"
+
+
+def tesseract_dpi() -> int:
+    raw = os.environ.get("TESSERACT_DPI", "220").strip()
+    try:
+        dpi = int(raw)
+    except ValueError:
+        dpi = 220
+    return max(96, min(dpi, 600))
+
+
+def tesseract_psm() -> str:
+    raw = os.environ.get("TESSERACT_PSM", "6").strip()
+    return raw or "6"
 
 
 def make_supabase_client() -> Client:
@@ -91,7 +133,7 @@ def build_placeholder_markdown(input_meta: list[dict[str, Any]]) -> str:
     lines.append("")
     lines.append("## Extracted Text")
     lines.append(
-        "No readable text could be extracted locally. For scanned/image PDFs, configure LIGHTON_OCR_ENDPOINT."
+        "No readable text could be extracted locally. For scanned/image PDFs, enable open-source OCR (Tesseract) or configure LIGHTON_OCR_ENDPOINT."
     )
     return "\n".join(lines)
 
@@ -174,6 +216,42 @@ def extract_pdf_text_sections(pdf_bytes: bytes) -> list[tuple[int, str]]:
     return sections
 
 
+def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    if fitz is None or pytesseract is None or Image is None:
+        raise RuntimeError("open_source_ocr_dependencies_missing")
+
+    dpi = tesseract_dpi()
+    zoom = dpi / 72.0
+    lang = tesseract_langs()
+    config = f"--psm {tesseract_psm()}"
+    sections: list[tuple[int, str]] = []
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:  # pragma: no cover - dependency/file specific
+        raise RuntimeError(f"open_source_ocr_pdf_open_failed:{exc}") from exc
+
+    try:
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                raw = pytesseract.image_to_string(image, lang=lang, config=config)
+            except Exception as exc:  # pragma: no cover - tesseract specific
+                raise RuntimeError(f"tesseract_ocr_failed:{exc}") from exc
+            finally:
+                image.close()
+
+            text = normalize_extracted_text(raw or "")
+            if text:
+                sections.append((page_index + 1, text))
+    finally:
+        doc.close()
+
+    return sections
+
+
 def download_storage_bytes(sb: Client, bucket: str, path: str) -> bytes:
     result = sb.storage.from_(bucket).download(path)
 
@@ -218,7 +296,7 @@ def build_markdown_from_extracted_files(file_results: list[dict[str, Any]]) -> s
             continue
 
         lines.append(
-            "No readable embedded text was found in this PDF. It may be scanned/image-based and needs OCR."
+            "No readable embedded text was found in this PDF. It may be scanned/image-based and needs OCR (Tesseract or external OCR)."
         )
         lines.append("")
 
@@ -320,6 +398,7 @@ async def process_job(job_id: str) -> dict[str, Any]:
         resolved_files = coerce_input_files(job_id, input_meta)
         extracted_files: list[dict[str, Any]] = []
         has_local_text = False
+        use_oss_ocr = open_source_ocr_enabled()
 
         for index, file_meta in enumerate(resolved_files):
             name = str(file_meta.get("name", f"input-{index}.pdf"))
@@ -344,8 +423,21 @@ async def process_job(job_id: str) -> dict[str, Any]:
             try:
                 pdf_bytes = download_storage_bytes(sb, bucket, path)
                 sections = extract_pdf_text_sections(pdf_bytes)
+                note = ""
+
+                if not sections and use_oss_ocr:
+                    try:
+                        sections = extract_pdf_text_sections_with_tesseract(pdf_bytes)
+                        if sections:
+                            note = "Extracted with open-source OCR (Tesseract)."
+                    except Exception as exc:  # pragma: no cover - env dependent
+                        note = f"Open-source OCR unavailable: {exc}"
+
                 has_local_text = has_local_text or bool(sections)
-                extracted_files.append({"name": name, "sections": sections})
+                item: dict[str, Any] = {"name": name, "sections": sections}
+                if note:
+                    item["note"] = note
+                extracted_files.append(item)
             except Exception as exc:  # pragma: no cover - storage/pdf dependent
                 extracted_files.append(
                     {
