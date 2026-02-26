@@ -18,10 +18,15 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     import pytesseract
+    from pytesseract import Output
     from PIL import Image
+    from PIL import ImageFilter, ImageOps
 except Exception:  # pragma: no cover - optional dependency
     pytesseract = None
+    Output = None
     Image = None
+    ImageFilter = None
+    ImageOps = None
 
 app = FastAPI(title="pdfword-ocr-worker", version="0.2.0")
 
@@ -29,6 +34,8 @@ _BULLET_RE = re.compile(r"^([\-*]|\d+[.)])\s+")
 _MULTISPACE_RE = re.compile(r"\s+")
 _PUNCT_END_RE = re.compile(r"[.!?:;)](?:['\"])?$")
 _HEADING_RE = re.compile(r"^[A-Z0-9][A-Z0-9\s/&()_-]{2,}$")
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+_TURKISH_CHARS = "çğıöşüÇĞİÖŞÜ"
 
 
 def utc_now() -> str:
@@ -63,6 +70,25 @@ def tesseract_dpi() -> int:
 def tesseract_psm() -> str:
     raw = os.environ.get("TESSERACT_PSM", "6").strip()
     return raw or "6"
+
+
+def tesseract_oem() -> str:
+    raw = os.environ.get("TESSERACT_OEM", "1").strip()
+    return raw if raw in {"0", "1", "2", "3"} else "1"
+
+
+def tesseract_psm_candidates() -> list[str]:
+    raw = os.environ.get("TESSERACT_PSM_CANDIDATES", "").strip()
+    values = raw.split(",") if raw else [tesseract_psm(), "4", "11"]
+    seen: set[str] = set()
+    result: list[str] = []
+    for part in values:
+        item = part.strip()
+        if not item or not item.isdigit() or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result or ["6", "4", "11"]
 
 
 def make_supabase_client() -> Client:
@@ -216,6 +242,162 @@ def extract_pdf_text_sections(pdf_bytes: bytes) -> list[tuple[int, str]]:
     return sections
 
 
+def _otsu_threshold(gray_image: Any) -> int:
+    histogram = gray_image.histogram()
+    if not histogram or len(histogram) < 256:
+        return 180
+
+    counts = histogram[:256]
+    total = sum(counts)
+    if total <= 0:
+        return 180
+
+    weighted_sum = sum(index * count for index, count in enumerate(counts))
+    sum_b = 0.0
+    weight_b = 0
+    best_variance = -1.0
+    threshold = 180
+
+    for index, count in enumerate(counts):
+        weight_b += count
+        if weight_b == 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f == 0:
+            break
+
+        sum_b += index * count
+        mean_b = sum_b / weight_b
+        mean_f = (weighted_sum - sum_b) / weight_f
+        variance = weight_b * weight_f * ((mean_b - mean_f) ** 2)
+
+        if variance > best_variance:
+            best_variance = variance
+            threshold = index
+
+    return max(40, min(threshold, 230))
+
+
+def _binarize_luma(gray_image: Any) -> Any:
+    threshold = _otsu_threshold(gray_image)
+    return gray_image.point(lambda px, t=threshold: 255 if px >= t else 0, mode="L")
+
+
+def _lanczos_resample() -> int:
+    if Image is None:
+        return 1
+    resampling = getattr(Image, "Resampling", None)
+    if resampling is not None:
+        return int(resampling.LANCZOS)
+    return int(getattr(Image, "LANCZOS", 1))
+
+
+def _build_tesseract_image_variants(image: Any) -> list[tuple[str, Any]]:
+    if Image is None:
+        return [("raw", image)]
+
+    gray = image.convert("L")
+    variants: list[tuple[str, Any]] = [("gray", gray)]
+
+    auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
+    variants.append(("gray_auto", auto))
+    variants.append(("binary_auto", _binarize_luma(auto)))
+
+    if ImageFilter is not None:
+        denoised = auto.filter(ImageFilter.MedianFilter(size=3))
+        variants.append(("gray_auto_median", denoised))
+        variants.append(("binary_auto_median", _binarize_luma(denoised)))
+
+    width, height = auto.size
+    if max(width, height) < 2600:
+        upscaled = auto.resize((width * 2, height * 2), _lanczos_resample())
+        variants.append(("gray_auto_2x", upscaled))
+        variants.append(("binary_auto_2x", _binarize_luma(upscaled)))
+
+    deduped: list[tuple[str, Any]] = []
+    seen = set()
+    for label, variant in variants:
+        key = (label, getattr(variant, "mode", ""), getattr(variant, "size", None))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((label, variant))
+    return deduped
+
+
+def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
+    normalized = normalize_extracted_text(text)
+    if not normalized:
+        return -1e9
+
+    text_len = len(normalized)
+    word_count = len(_WORD_RE.findall(normalized))
+    turkish_hits = sum(normalized.count(ch) for ch in _TURKISH_CHARS)
+    replacement_hits = normalized.count("\ufffd")
+    symbol_noise = normalized.count("|") + normalized.count("~")
+
+    return (
+        (mean_confidence * 4.0)
+        + float(text_len)
+        + float(word_count * 2)
+        + float(turkish_hits * 8)
+        - float(replacement_hits * 25)
+        - float(symbol_noise * 4)
+    )
+
+
+def _tesseract_config(psm: str) -> str:
+    return (
+        f"--oem {tesseract_oem()} --psm {psm} "
+        "-c preserve_interword_spaces=1"
+    )
+
+
+def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, float]:
+    if pytesseract is None:
+        return "", -1.0
+
+    config = _tesseract_config(psm)
+
+    text = ""
+    mean_conf = -1.0
+
+    if Output is not None:
+        try:
+            data = pytesseract.image_to_data(
+                image,
+                lang=lang,
+                config=config,
+                output_type=Output.DICT,
+            )
+            tokens: list[str] = []
+            confs: list[float] = []
+            for token, conf in zip(data.get("text", []), data.get("conf", [])):
+                token_str = str(token or "").strip()
+                if token_str:
+                    tokens.append(token_str)
+                try:
+                    conf_val = float(conf)
+                except (TypeError, ValueError):
+                    continue
+                if conf_val >= 0:
+                    confs.append(conf_val)
+            text = " ".join(tokens)
+            if confs:
+                mean_conf = sum(confs) / len(confs)
+        except Exception:
+            text = ""
+            mean_conf = -1.0
+
+    if not text:
+        try:
+            text = pytesseract.image_to_string(image, lang=lang, config=config)
+        except Exception:
+            text = ""
+
+    return text, mean_conf
+
+
 def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int, str]]:
     if fitz is None or pytesseract is None or Image is None:
         raise RuntimeError("open_source_ocr_dependencies_missing")
@@ -223,7 +405,7 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
     dpi = tesseract_dpi()
     zoom = dpi / 72.0
     lang = tesseract_langs()
-    config = f"--psm {tesseract_psm()}"
+    psm_candidates = tesseract_psm_candidates()
     sections: list[tuple[int, str]] = []
 
     try:
@@ -237,7 +419,37 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             image = Image.open(io.BytesIO(pix.tobytes("png")))
             try:
-                raw = pytesseract.image_to_string(image, lang=lang, config=config)
+                best_text = ""
+                best_score = -1e9
+                best_variant: Any | None = None
+                best_psm = psm_candidates[0] if psm_candidates else "6"
+
+                for _, variant in _build_tesseract_image_variants(image):
+                    for psm in psm_candidates:
+                        candidate_text, candidate_conf = _run_tesseract_candidate(
+                            variant, lang, psm
+                        )
+                        score = _ocr_candidate_score(candidate_text, candidate_conf)
+                        if score > best_score:
+                            best_score = score
+                            best_text = candidate_text
+                            best_variant = variant
+                            best_psm = psm
+
+                if not best_text.strip():
+                    raise RuntimeError("tesseract_ocr_empty_result")
+                raw = best_text
+                if best_variant is not None:
+                    try:
+                        pretty = pytesseract.image_to_string(
+                            best_variant,
+                            lang=lang,
+                            config=_tesseract_config(best_psm),
+                        )
+                        if pretty.strip():
+                            raw = pretty
+                    except Exception:
+                        pass
             except Exception as exc:  # pragma: no cover - tesseract specific
                 raise RuntimeError(f"tesseract_ocr_failed:{exc}") from exc
             finally:

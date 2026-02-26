@@ -88,6 +88,8 @@ Worker env vars:
 - `TESSERACT_LANG` (default: `tur+eng`)
 - `TESSERACT_DPI` (default: `220`)
 - `TESSERACT_PSM` (default: `6`)
+- `TESSERACT_OEM` (default: `1`)
+- `TESSERACT_PSM_CANDIDATES` (default: `6,4,11`)
 - Optional LightOn endpoint integration:
   - `LIGHTON_OCR_ENDPOINT`
   - `LIGHTON_OCR_TOKEN`

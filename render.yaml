@@ -26,6 +26,10 @@ services:
         value: "220"
       - key: TESSERACT_PSM
         value: "6"
+      - key: TESSERACT_OEM
+        value: "1"
+      - key: TESSERACT_PSM_CANDIDATES
+        value: 6,4,11
       - key: LIGHTON_OCR_ENDPOINT
         sync: false
       - key: LIGHTON_OCR_TOKEN
