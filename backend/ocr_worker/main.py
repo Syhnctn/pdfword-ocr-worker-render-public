@@ -86,11 +86,11 @@ def tesseract_final_lang_candidates() -> list[str]:
 
 
 def tesseract_dpi() -> int:
-    raw = os.environ.get("TESSERACT_DPI", "180").strip()
+    raw = os.environ.get("TESSERACT_DPI", "300").strip()
     try:
         dpi = int(raw)
     except ValueError:
-        dpi = 180
+        dpi = 300
     return max(96, min(dpi, 600))
 
 
@@ -106,7 +106,7 @@ def tesseract_oem() -> str:
 
 def tesseract_psm_candidates() -> list[str]:
     raw = os.environ.get("TESSERACT_PSM_CANDIDATES", "").strip()
-    values = raw.split(",") if raw else [tesseract_psm(), "4"]
+    values = raw.split(",") if raw else [tesseract_psm()]
     seen: set[str] = set()
     result: list[str] = []
     for part in values:
@@ -115,33 +115,33 @@ def tesseract_psm_candidates() -> list[str]:
             continue
         seen.add(item)
         result.append(item)
-    return result or ["6", "4"]
+    return result or ["6"]
 
 
 def tesseract_max_variants() -> int:
-    raw = os.environ.get("TESSERACT_MAX_VARIANTS", "3").strip()
+    raw = os.environ.get("TESSERACT_MAX_VARIANTS", "2").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 3
+        value = 2
     return max(1, min(value, 12))
 
 
 def tesseract_call_timeout_sec() -> float:
-    raw = os.environ.get("TESSERACT_CALL_TIMEOUT_SEC", "8").strip()
+    raw = os.environ.get("TESSERACT_CALL_TIMEOUT_SEC", "10").strip()
     try:
         value = float(raw)
     except ValueError:
-        value = 8.0
+        value = 10.0
     return max(2.0, min(value, 60.0))
 
 
 def tesseract_max_attempts() -> int:
-    raw = os.environ.get("TESSERACT_MAX_ATTEMPTS", "4").strip()
+    raw = os.environ.get("TESSERACT_MAX_ATTEMPTS", "3").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 4
+        value = 3
     return max(1, min(value, 20))
 
 
@@ -539,12 +539,13 @@ def _build_tesseract_image_variants(image: Any) -> list[tuple[str, Any]]:
 
     auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
     variants.append(("gray_auto", auto))
-    variants.append(("binary_auto", _binarize_luma(auto)))
     variants.append(("gray", gray))
 
     if ImageFilter is not None:
         denoised = auto.filter(ImageFilter.MedianFilter(size=3))
         variants.append(("gray_auto_median", denoised))
+    variants.append(("binary_auto", _binarize_luma(auto)))
+    if ImageFilter is not None:
         variants.append(("binary_auto_median", _binarize_luma(denoised)))
 
     width, height = auto.size
