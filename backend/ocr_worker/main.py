@@ -626,39 +626,16 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
 
     config = _tesseract_config(psm)
     timeout_sec = tesseract_call_timeout_sec()
+    try:
+        text = pytesseract.image_to_string(
+            image, lang=lang, config=config, timeout=timeout_sec
+        )
+    except TypeError:
+        text = pytesseract.image_to_string(image, lang=lang, config=config)
+    except Exception:
+        text = ""
 
-    text = ""
-    mean_conf = -1.0
-
-    if Output is not None:
-        try:
-            data = pytesseract.image_to_data(
-                image,
-                lang=lang,
-                config=config,
-                output_type=Output.DICT,
-                timeout=timeout_sec,
-            )
-            tokens: list[str] = []
-            confs: list[float] = []
-            for token, conf in zip(data.get("text", []), data.get("conf", [])):
-                token_str = str(token or "").strip()
-                if token_str:
-                    tokens.append(token_str)
-                try:
-                    conf_val = float(conf)
-                except (TypeError, ValueError):
-                    continue
-                if conf_val >= 0:
-                    confs.append(conf_val)
-            text = " ".join(tokens)
-            if confs:
-                mean_conf = sum(confs) / len(confs)
-        except Exception:
-            text = ""
-            mean_conf = -1.0
-
-    return text, mean_conf
+    return text, -1.0
 
 
 def _run_tesseract_final_passes(
