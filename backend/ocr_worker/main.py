@@ -57,8 +57,8 @@ def open_source_ocr_enabled() -> bool:
 
 
 def tesseract_langs() -> str:
-    value = os.environ.get("TESSERACT_LANG", "tur+eng").strip()
-    return value or "tur+eng"
+    value = os.environ.get("TESSERACT_LANG", "tur").strip()
+    return value or "tur"
 
 
 def tesseract_final_lang_candidates() -> list[str]:
