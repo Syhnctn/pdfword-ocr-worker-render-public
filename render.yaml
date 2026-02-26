@@ -27,15 +27,15 @@ services:
       - key: OCRMYPDF_JOBS
         value: "1"
       - key: OCRMYPDF_TIMEOUT_SEC
-        value: "600"
+        value: "240"
       - key: OCRMYPDF_TESSERACT_TIMEOUT_SEC
         value: "60"
       - key: OCRMYPDF_FORCE_OCR
         value: "true"
       - key: OCRMYPDF_ROTATE_PAGES
-        value: "true"
+        value: "false"
       - key: OCRMYPDF_DESKEW
-        value: "true"
+        value: "false"
       - key: OCRMYPDF_CLEAN_FINAL
         value: "false"
       - key: OCRMYPDF_OUTPUT_TYPE

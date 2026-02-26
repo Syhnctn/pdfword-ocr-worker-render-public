@@ -1,9 +1,11 @@
 ﻿import io
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
@@ -175,7 +177,7 @@ def ocrmypdf_jobs() -> int:
 
 
 def ocrmypdf_timeout_sec() -> float:
-    raw = os.environ.get("OCRMYPDF_TIMEOUT_SEC", "600").strip()
+    raw = os.environ.get("OCRMYPDF_TIMEOUT_SEC", "240").strip()
     try:
         value = float(raw)
     except ValueError:
@@ -200,11 +202,11 @@ def ocrmypdf_force_ocr() -> bool:
 
 
 def ocrmypdf_rotate_pages() -> bool:
-    return env_flag("OCRMYPDF_ROTATE_PAGES", True)
+    return env_flag("OCRMYPDF_ROTATE_PAGES", False)
 
 
 def ocrmypdf_deskew() -> bool:
-    return env_flag("OCRMYPDF_DESKEW", True)
+    return env_flag("OCRMYPDF_DESKEW", False)
 
 
 def ocrmypdf_clean_final() -> bool:
@@ -626,6 +628,58 @@ def _ocrmypdf_cli_args(
     return args
 
 
+def _run_subprocess_text(
+    args: list[str], timeout_sec: float, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:  # pragma: no cover - Windows fallback
+                proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:
+            stdout, stderr = "", ""
+        elapsed = round(time.monotonic() - started, 2)
+        raise RuntimeError(f"subprocess_timeout:{int(timeout_sec)}s elapsed={elapsed}s") from exc
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+
+    return subprocess.CompletedProcess(
+        args=args,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int, str]]:
     timeout_sec = ocrmypdf_timeout_sec()
 
@@ -638,23 +692,34 @@ def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int,
             f.write(pdf_bytes)
 
         args = _ocrmypdf_cli_args(input_path, output_path, sidecar_path)
+        print(
+            "[ocrmypdf:start]",
+            {
+                "timeout_sec": timeout_sec,
+                "lang": ocrmypdf_langs(),
+                "jobs": ocrmypdf_jobs(),
+                "rotate_pages": ocrmypdf_rotate_pages(),
+                "deskew": ocrmypdf_deskew(),
+                "force_ocr": ocrmypdf_force_ocr(),
+            },
+        )
+        started = time.monotonic()
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_sec,
+            result = _run_subprocess_text(
+                args=args,
+                timeout_sec=timeout_sec,
                 env=_ocrmypdf_subprocess_env(),
-                check=False,
             )
         except FileNotFoundError as exc:
             raise RuntimeError("ocrmypdf_not_installed") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"ocrmypdf_timeout:{int(timeout_sec)}s") from exc
+        except RuntimeError as exc:
+            if str(exc).startswith("subprocess_timeout:"):
+                raise RuntimeError(f"ocrmypdf_timeout:{int(timeout_sec)}s") from exc
+            raise
         except Exception as exc:
             raise RuntimeError(f"ocrmypdf_failed:{exc}") from exc
+        finally:
+            print("[ocrmypdf:end]", {"elapsed_sec": round(time.monotonic() - started, 2)})
 
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
