@@ -1,7 +1,10 @@
-import io
+﻿import io
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 import httpx
@@ -35,7 +38,7 @@ _MULTISPACE_RE = re.compile(r"\s+")
 _PUNCT_END_RE = re.compile(r"[.!?:;)](?:['\"])?$")
 _HEADING_RE = re.compile(r"^[A-Z0-9][A-Z0-9\s/&()_-]{2,}$")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
-_TURKISH_CHARS = "çğıöşüÇĞİÖŞÜ"
+_TURKISH_CHARS = "\u00e7\u011f\u0131\u00f6\u015f\u00fc\u00c7\u011e\u0130\u00d6\u015e\u00dc"
 
 
 def utc_now() -> str:
@@ -59,6 +62,7 @@ def tesseract_langs() -> str:
 
 
 def tesseract_final_lang_candidates() -> list[str]:
+    available = set(pytesseract_languages()) or set(tesseract_cli_languages())
     base = tesseract_langs()
     candidates = [base]
     if "tur" in base and base != "tur":
@@ -71,9 +75,14 @@ def tesseract_final_lang_candidates() -> list[str]:
         key = item.strip()
         if not key or key in seen:
             continue
+        if available and "+" not in key and key not in available:
+            continue
         seen.add(key)
         result.append(key)
-    return result or ["tur", "eng"]
+    if result:
+        return result
+    fallbacks = [lang for lang in ("tur", "eng") if not available or lang in available]
+    return fallbacks or ["eng"]
 
 
 def tesseract_dpi() -> int:
@@ -134,6 +143,190 @@ def tesseract_max_attempts() -> int:
     except ValueError:
         value = 4
     return max(1, min(value, 20))
+
+
+def tesseract_cmd() -> str:
+    value = os.environ.get("TESSERACT_CMD", "").strip()
+    return value or "tesseract"
+
+
+def _candidate_tessdata_dirs() -> list[str]:
+    candidates: list[str] = []
+    env_path = os.environ.get("TESSDATA_PREFIX", "").strip()
+    if env_path:
+        candidates.append(env_path)
+        candidates.append(os.path.join(env_path, "tessdata"))
+
+    candidates.extend(
+        [
+            "/usr/share/tesseract-ocr/5/tessdata",
+            "/usr/share/tesseract-ocr/4.00/tessdata",
+            "/usr/share/tesseract-ocr/tessdata",
+            "/usr/share/tessdata",
+            "/usr/local/share/tessdata",
+        ]
+    )
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in candidates:
+        path = os.path.abspath(item)
+        if path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
+
+
+def _looks_like_tessdata_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    for name in ("eng.traineddata", "tur.traineddata", "osd.traineddata"):
+        if os.path.exists(os.path.join(path, name)):
+            return True
+    return False
+
+
+@lru_cache(maxsize=1)
+def resolve_tessdata_dir() -> str:
+    for path in _candidate_tessdata_dirs():
+        if _looks_like_tessdata_dir(path):
+            return path
+    return ""
+
+
+def _clear_tessdata_cache() -> None:
+    resolve_tessdata_dir.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def ensure_tesseract_runtime_config() -> dict[str, Any]:
+    cmd = tesseract_cmd()
+    tessdata_dir = resolve_tessdata_dir()
+
+    if pytesseract is not None:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        except Exception:
+            pass
+
+    if tessdata_dir:
+        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+
+    info = {
+        "tesseract_cmd": cmd,
+        "tesseract_path": shutil.which(cmd),
+        "tessdata_dir": tessdata_dir,
+        "tessdata_candidates": _candidate_tessdata_dirs(),
+        "eng_traineddata_exists": bool(
+            tessdata_dir and os.path.exists(os.path.join(tessdata_dir, "eng.traineddata"))
+        ),
+        "tur_traineddata_exists": bool(
+            tessdata_dir and os.path.exists(os.path.join(tessdata_dir, "tur.traineddata"))
+        ),
+    }
+    print(
+        "[ocr-runtime]",
+        {
+            "tesseract_path": info["tesseract_path"],
+            "tessdata_dir": info["tessdata_dir"],
+            "tur_traineddata_exists": info["tur_traineddata_exists"],
+        },
+    )
+    return info
+
+
+def _tesseract_subprocess_env() -> dict[str, str]:
+    ensure_tesseract_runtime_config()
+    return dict(os.environ)
+
+
+def _parse_lang_lines(raw: str) -> list[str]:
+    langs: list[str] = []
+    for line in raw.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if value.lower().startswith("list of available languages"):
+            continue
+        langs.append(value)
+    return langs
+
+
+def tesseract_cli_languages() -> list[str]:
+    cmd = tesseract_cmd()
+    try:
+        res = subprocess.run(
+            [cmd, "--list-langs"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=_tesseract_subprocess_env(),
+            check=False,
+        )
+    except Exception:
+        return []
+    text_out = (res.stdout or "") + "\n" + (res.stderr or "")
+    return _parse_lang_lines(text_out)
+
+
+def pytesseract_languages() -> list[str]:
+    if pytesseract is None:
+        return []
+
+    info = ensure_tesseract_runtime_config()
+    config = ""
+    tessdata_dir = str(info.get("tessdata_dir") or "").strip()
+    if tessdata_dir:
+        config = f'--tessdata-dir "{tessdata_dir}"'
+
+    try:
+        langs = pytesseract.get_languages(config=config)
+    except TypeError:
+        langs = pytesseract.get_languages()
+    except Exception:
+        return []
+
+    result = [str(item).strip() for item in (langs or []) if str(item).strip()]
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in result:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def ocr_runtime_debug_info() -> dict[str, Any]:
+    info = dict(ensure_tesseract_runtime_config())
+    info.update(
+        {
+            "env_TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX", ""),
+            "env_TESSERACT_LANG": os.environ.get("TESSERACT_LANG", ""),
+            "pytesseract_languages": pytesseract_languages(),
+            "tesseract_cli_languages": tesseract_cli_languages(),
+        }
+    )
+
+    cmd = tesseract_cmd()
+    try:
+        version = subprocess.run(
+            [cmd, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=_tesseract_subprocess_env(),
+            check=False,
+        )
+        info["tesseract_version"] = (version.stdout or version.stderr or "").splitlines()[:3]
+    except Exception as exc:
+        info["tesseract_version_error"] = str(exc)
+    return info
 
 
 def make_supabase_client() -> Client:
@@ -405,10 +598,16 @@ def _ocr_candidate_good_enough(text: str, mean_confidence: float) -> bool:
 
 
 def _tesseract_config(psm: str) -> str:
-    return (
-        f"--oem {tesseract_oem()} --psm {psm} "
-        "-c preserve_interword_spaces=1"
-    )
+    info = ensure_tesseract_runtime_config()
+    parts = [
+        f"--oem {tesseract_oem()}",
+        f"--psm {psm}",
+        "-c preserve_interword_spaces=1",
+    ]
+    tessdata_dir = str(info.get("tessdata_dir") or "").strip()
+    if tessdata_dir:
+        parts.append(f'--tessdata-dir "{tessdata_dir}"')
+    return " ".join(parts)
 
 
 def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, float]:
@@ -825,6 +1024,12 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/internal/debug/ocr")
+def debug_ocr_runtime(request: Request) -> dict[str, Any]:
+    assert_worker_secret(request)
+    return ocr_runtime_debug_info()
+
+
 class ProcessRequest(BaseModel):
     job_id: str
 
@@ -839,3 +1044,4 @@ async def process(request: Request, payload: ProcessRequest) -> dict[str, Any]:
 async def process_with_path(job_id: str, request: Request) -> dict[str, Any]:
     assert_worker_secret(request)
     return await process_job(job_id)
+

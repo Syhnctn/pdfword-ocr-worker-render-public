@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
