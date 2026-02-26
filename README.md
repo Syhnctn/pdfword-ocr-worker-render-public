@@ -76,7 +76,7 @@ flutter run -d chrome --dart-define=USE_REAL_BACKEND=true --dart-define=SUPABASE
 - Code: `backend/ocr_worker/main.py`
 - Dockerfile: `backend/ocr_worker/Dockerfile`
 - Requirements: `backend/ocr_worker/requirements.txt`
-- Supports local embedded-text extraction for text PDFs (`pypdf`), open-source OCR fallback (`Tesseract`) for scanned PDFs, and optional external OCR fallback.
+- Supports local embedded-text extraction for text PDFs (`pypdf`), open-source OCR fallback (`OCRmyPDF + Tesseract`, then direct Tesseract) for scanned PDFs, and optional external OCR fallback.
 
 Worker env vars:
 
@@ -85,14 +85,24 @@ Worker env vars:
 - `OCR_INPUT_BUCKET` (default: `ocr-inputs`)
 - `OCR_RESULTS_BUCKET` (default: `ocr-results`)
 - `OPEN_SOURCE_OCR_ENABLED` (default: `true`)
-- `TESSERACT_LANG` (default: `tur+eng`)
-- `TESSERACT_DPI` (default: `180`)
+- `OCRMYPDF_ENABLED` (default: `true`)
+- `OCRMYPDF_LANG` (default: uses `TESSERACT_LANG`)
+- `OCRMYPDF_JOBS` (default: `1`)
+- `OCRMYPDF_TIMEOUT_SEC` (default: `600`)
+- `OCRMYPDF_TESSERACT_TIMEOUT_SEC` (default: derived from `TESSERACT_CALL_TIMEOUT_SEC`)
+- `OCRMYPDF_FORCE_OCR` (default: `true`)
+- `OCRMYPDF_ROTATE_PAGES` (default: `true`)
+- `OCRMYPDF_DESKEW` (default: `true`)
+- `OCRMYPDF_CLEAN_FINAL` (default: `false`)
+- `OCRMYPDF_OUTPUT_TYPE` (default: `pdf`)
+- `TESSERACT_LANG` (default: `tur`)
+- `TESSERACT_DPI` (default: `300`)
 - `TESSERACT_PSM` (default: `6`)
 - `TESSERACT_OEM` (default: `1`)
 - `TESSERACT_PSM_CANDIDATES` (default: `6,4`)
 - `TESSERACT_MAX_VARIANTS` (default: `3`)
-- `TESSERACT_CALL_TIMEOUT_SEC` (default: `8`)
-- `TESSERACT_MAX_ATTEMPTS` (default: `4`)
+- `TESSERACT_CALL_TIMEOUT_SEC` (default: `10`)
+- `TESSERACT_MAX_ATTEMPTS` (default: `3`)
 - Optional LightOn endpoint integration:
   - `LIGHTON_OCR_ENDPOINT`
   - `LIGHTON_OCR_TOKEN`

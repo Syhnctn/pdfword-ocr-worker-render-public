@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
@@ -150,6 +151,71 @@ def tesseract_cmd() -> str:
     return value or "tesseract"
 
 
+def ocrmypdf_enabled() -> bool:
+    return env_flag("OCRMYPDF_ENABLED", True)
+
+
+def ocrmypdf_cmd() -> str:
+    value = os.environ.get("OCRMYPDF_CMD", "").strip()
+    return value or "ocrmypdf"
+
+
+def ocrmypdf_langs() -> str:
+    value = os.environ.get("OCRMYPDF_LANG", "").strip()
+    return value or tesseract_langs()
+
+
+def ocrmypdf_jobs() -> int:
+    raw = os.environ.get("OCRMYPDF_JOBS", "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 1
+    return max(1, min(value, 8))
+
+
+def ocrmypdf_timeout_sec() -> float:
+    raw = os.environ.get("OCRMYPDF_TIMEOUT_SEC", "600").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 600.0
+    return max(30.0, min(value, 3600.0))
+
+
+def ocrmypdf_tesseract_timeout_sec() -> int:
+    raw = os.environ.get("OCRMYPDF_TESSERACT_TIMEOUT_SEC", "").strip()
+    if raw:
+        try:
+            value = int(float(raw))
+        except ValueError:
+            value = 0
+        if value > 0:
+            return max(5, min(value, 600))
+    return max(10, min(int(tesseract_call_timeout_sec() * 6), 600))
+
+
+def ocrmypdf_force_ocr() -> bool:
+    return env_flag("OCRMYPDF_FORCE_OCR", True)
+
+
+def ocrmypdf_rotate_pages() -> bool:
+    return env_flag("OCRMYPDF_ROTATE_PAGES", True)
+
+
+def ocrmypdf_deskew() -> bool:
+    return env_flag("OCRMYPDF_DESKEW", True)
+
+
+def ocrmypdf_clean_final() -> bool:
+    return env_flag("OCRMYPDF_CLEAN_FINAL", False)
+
+
+def ocrmypdf_output_type() -> str:
+    value = os.environ.get("OCRMYPDF_OUTPUT_TYPE", "pdf").strip().lower()
+    return value or "pdf"
+
+
 def _candidate_tessdata_dirs() -> list[str]:
     candidates: list[str] = []
     env_path = os.environ.get("TESSDATA_PREFIX", "").strip()
@@ -241,6 +307,11 @@ def _tesseract_subprocess_env() -> dict[str, str]:
     return dict(os.environ)
 
 
+def _ocrmypdf_subprocess_env() -> dict[str, str]:
+    ensure_tesseract_runtime_config()
+    return dict(os.environ)
+
+
 def _parse_lang_lines(raw: str) -> list[str]:
     langs: list[str] = []
     for line in raw.splitlines():
@@ -306,8 +377,12 @@ def ocr_runtime_debug_info() -> dict[str, Any]:
         {
             "env_TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX", ""),
             "env_TESSERACT_LANG": os.environ.get("TESSERACT_LANG", ""),
+            "env_OCRMYPDF_LANG": os.environ.get("OCRMYPDF_LANG", ""),
             "pytesseract_languages": pytesseract_languages(),
             "tesseract_cli_languages": tesseract_cli_languages(),
+            "ocrmypdf_path": shutil.which(ocrmypdf_cmd()),
+            "ghostscript_path": shutil.which("gs"),
+            "qpdf_path": shutil.which("qpdf"),
         }
     )
 
@@ -326,6 +401,26 @@ def ocr_runtime_debug_info() -> dict[str, Any]:
         info["tesseract_version"] = (version.stdout or version.stderr or "").splitlines()[:3]
     except Exception as exc:
         info["tesseract_version_error"] = str(exc)
+
+    for binary, key in (
+        (ocrmypdf_cmd(), "ocrmypdf_version"),
+        ("gs", "ghostscript_version"),
+        ("qpdf", "qpdf_version"),
+    ):
+        try:
+            version = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                env=_ocrmypdf_subprocess_env(),
+                check=False,
+            )
+            info[key] = (version.stdout or version.stderr or "").splitlines()[:3]
+        except Exception as exc:
+            info[f"{key}_error"] = str(exc)
     return info
 
 
@@ -397,7 +492,7 @@ def build_placeholder_markdown(input_meta: list[dict[str, Any]]) -> str:
     lines.append("")
     lines.append("## Extracted Text")
     lines.append(
-        "No readable text could be extracted locally. For scanned/image PDFs, enable open-source OCR (Tesseract) or configure LIGHTON_OCR_ENDPOINT."
+        "No readable text could be extracted locally. For scanned/image PDFs, enable open-source OCR (OCRmyPDF/Tesseract) or configure LIGHTON_OCR_ENDPOINT."
     )
     return "\n".join(lines)
 
@@ -478,6 +573,105 @@ def extract_pdf_text_sections(pdf_bytes: bytes) -> list[tuple[int, str]]:
             sections.append((page_index, text))
 
     return sections
+
+
+def _parse_sidecar_sections(sidecar_text: str) -> list[tuple[int, str]]:
+    raw = sidecar_text.replace("\r\n", "\n").replace("\r", "\n")
+    pages = raw.split("\f")
+    sections: list[tuple[int, str]] = []
+    for page_index, page_text in enumerate(pages, start=1):
+        text = normalize_extracted_text(page_text)
+        if text:
+            sections.append((page_index, text))
+    return sections
+
+
+def _ocrmypdf_cli_args(
+    input_path: str, output_path: str, sidecar_path: str
+) -> list[str]:
+    args = [ocrmypdf_cmd()]
+    args.extend(["--language", ocrmypdf_langs()])
+    args.extend(["--jobs", str(ocrmypdf_jobs())])
+    args.extend(["--optimize", "0"])
+    args.extend(["--output-type", ocrmypdf_output_type()])
+    args.extend(["--tesseract-timeout", str(ocrmypdf_tesseract_timeout_sec())])
+    args.extend(["--sidecar", sidecar_path])
+
+    if ocrmypdf_force_ocr():
+        args.append("--force-ocr")
+    else:
+        args.append("--skip-text")
+    if ocrmypdf_rotate_pages():
+        args.append("--rotate-pages")
+    if ocrmypdf_deskew():
+        args.append("--deskew")
+    if ocrmypdf_clean_final():
+        args.append("--clean-final")
+
+    args.extend([input_path, output_path])
+    return args
+
+
+def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    timeout_sec = ocrmypdf_timeout_sec()
+
+    with tempfile.TemporaryDirectory(prefix="ocrmypdf_") as temp_dir:
+        input_path = os.path.join(temp_dir, "input.pdf")
+        output_path = os.path.join(temp_dir, "ocr.pdf")
+        sidecar_path = os.path.join(temp_dir, "sidecar.txt")
+
+        with open(input_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        args = _ocrmypdf_cli_args(input_path, output_path, sidecar_path)
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                env=_ocrmypdf_subprocess_env(),
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ocrmypdf_not_installed") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"ocrmypdf_timeout:{int(timeout_sec)}s") from exc
+        except Exception as exc:
+            raise RuntimeError(f"ocrmypdf_failed:{exc}") from exc
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            message = stderr or stdout or f"exit_code={result.returncode}"
+            message = _MULTISPACE_RE.sub(" ", message).strip()
+            if len(message) > 240:
+                message = message[:240].rstrip() + "..."
+            raise RuntimeError(f"ocrmypdf_cli_failed:{message}")
+
+        sections: list[tuple[int, str]] = []
+        if os.path.exists(output_path):
+            try:
+                with open(output_path, "rb") as f:
+                    ocr_pdf_bytes = f.read()
+                sections = extract_pdf_text_sections(ocr_pdf_bytes)
+            except Exception:
+                sections = []
+
+        if not sections and os.path.exists(sidecar_path):
+            try:
+                with open(sidecar_path, "r", encoding="utf-8", errors="replace") as f:
+                    sidecar_text = f.read()
+                sections = _parse_sidecar_sections(sidecar_text)
+            except Exception:
+                sections = []
+
+        if not sections:
+            raise RuntimeError("ocrmypdf_empty_result")
+
+        return sections
 
 
 def _otsu_threshold(gray_image: Any) -> int:
@@ -832,7 +1026,7 @@ def build_markdown_from_extracted_files(file_results: list[dict[str, Any]]) -> s
             continue
 
         lines.append(
-            "No readable embedded text was found in this PDF. It may be scanned/image-based and needs OCR (Tesseract or external OCR)."
+            "No readable embedded text was found in this PDF. It may be scanned/image-based and needs OCR (OCRmyPDF/Tesseract or external OCR)."
         )
         lines.append("")
 
@@ -962,12 +1156,26 @@ async def process_job(job_id: str) -> dict[str, Any]:
                 note = ""
 
                 if not sections and use_oss_ocr:
-                    try:
-                        sections = extract_pdf_text_sections_with_tesseract(pdf_bytes)
-                        if sections:
-                            note = "Extracted with open-source OCR (Tesseract)."
-                    except Exception as exc:  # pragma: no cover - env dependent
-                        note = f"Open-source OCR unavailable: {exc}"
+                    ocr_errors: list[str] = []
+
+                    if ocrmypdf_enabled():
+                        try:
+                            sections = extract_pdf_text_sections_with_ocrmypdf(pdf_bytes)
+                            if sections:
+                                note = "Extracted with open-source OCR (OCRmyPDF + Tesseract)."
+                        except Exception as exc:  # pragma: no cover - env dependent
+                            ocr_errors.append(f"OCRmyPDF unavailable: {exc}")
+
+                    if not sections:
+                        try:
+                            sections = extract_pdf_text_sections_with_tesseract(pdf_bytes)
+                            if sections:
+                                note = "Extracted with open-source OCR (Tesseract fallback)."
+                        except Exception as exc:  # pragma: no cover - env dependent
+                            ocr_errors.append(f"Tesseract OCR unavailable: {exc}")
+
+                    if not sections and ocr_errors:
+                        note = " | ".join(ocr_errors[:2])
 
                 has_local_text = has_local_text or bool(sections)
                 item: dict[str, Any] = {"name": name, "sections": sections}

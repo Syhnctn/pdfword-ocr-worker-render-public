@@ -20,10 +20,30 @@ services:
         sync: false
       - key: OPEN_SOURCE_OCR_ENABLED
         value: "true"
-      - key: TESSERACT_LANG
+      - key: OCRMYPDF_ENABLED
+        value: "true"
+      - key: OCRMYPDF_LANG
         value: tur+eng
+      - key: OCRMYPDF_JOBS
+        value: "1"
+      - key: OCRMYPDF_TIMEOUT_SEC
+        value: "600"
+      - key: OCRMYPDF_TESSERACT_TIMEOUT_SEC
+        value: "60"
+      - key: OCRMYPDF_FORCE_OCR
+        value: "true"
+      - key: OCRMYPDF_ROTATE_PAGES
+        value: "true"
+      - key: OCRMYPDF_DESKEW
+        value: "true"
+      - key: OCRMYPDF_CLEAN_FINAL
+        value: "false"
+      - key: OCRMYPDF_OUTPUT_TYPE
+        value: pdf
+      - key: TESSERACT_LANG
+        value: tur
       - key: TESSERACT_DPI
-        value: "180"
+        value: "300"
       - key: TESSERACT_PSM
         value: "6"
       - key: TESSERACT_OEM
@@ -33,9 +53,9 @@ services:
       - key: TESSERACT_MAX_VARIANTS
         value: "3"
       - key: TESSERACT_CALL_TIMEOUT_SEC
-        value: "8"
+        value: "10"
       - key: TESSERACT_MAX_ATTEMPTS
-        value: "4"
+        value: "3"
       - key: LIGHTON_OCR_ENDPOINT
         sync: false
       - key: LIGHTON_OCR_TOKEN

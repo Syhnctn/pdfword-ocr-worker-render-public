@@ -8,6 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ghostscript \
+        ocrmypdf \
+        qpdf \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-tur \
