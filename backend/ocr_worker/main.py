@@ -373,6 +373,17 @@ def pytesseract_languages() -> list[str]:
 
 def ocr_runtime_debug_info() -> dict[str, Any]:
     info = dict(ensure_tesseract_runtime_config())
+    tessdata_dir = str(info.get("tessdata_dir") or "").strip()
+
+    def _traineddata_size(name: str) -> int | None:
+        if not tessdata_dir:
+            return None
+        path = os.path.join(tessdata_dir, name)
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            return None
+
     info.update(
         {
             "env_TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX", ""),
@@ -383,6 +394,9 @@ def ocr_runtime_debug_info() -> dict[str, Any]:
             "ocrmypdf_path": shutil.which(ocrmypdf_cmd()),
             "ghostscript_path": shutil.which("gs"),
             "qpdf_path": shutil.which("qpdf"),
+            "tur_traineddata_bytes": _traineddata_size("tur.traineddata"),
+            "eng_traineddata_bytes": _traineddata_size("eng.traineddata"),
+            "osd_traineddata_bytes": _traineddata_size("osd.traineddata"),
         }
     )
 

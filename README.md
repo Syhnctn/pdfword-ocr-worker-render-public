@@ -77,6 +77,7 @@ flutter run -d chrome --dart-define=USE_REAL_BACKEND=true --dart-define=SUPABASE
 - Dockerfile: `backend/ocr_worker/Dockerfile`
 - Requirements: `backend/ocr_worker/requirements.txt`
 - Supports local embedded-text extraction for text PDFs (`pypdf`), open-source OCR fallback (`OCRmyPDF + Tesseract`, then direct Tesseract) for scanned PDFs, and optional external OCR fallback.
+- Render worker image includes a Turkish `tessdata_best` model (`tur.traineddata`) for improved TR OCR attempts.
 
 Worker env vars:
 

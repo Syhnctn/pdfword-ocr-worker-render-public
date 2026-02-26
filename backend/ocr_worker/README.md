@@ -6,6 +6,7 @@ Capabilities:
 - Extracts embedded text from text-based PDFs locally (`pypdf`) and writes readable DOCX output.
 - Tries open-source OCR (`OCRmyPDF + Tesseract`) for scanned/image PDFs, then falls back to direct Tesseract OCR.
 - If configured, can call external OCR (`LIGHTON_OCR_ENDPOINT`) as an additional fallback.
+- Render Docker image is tuned for Turkish OCR by installing `tessdata_best` `tur.traineddata` while keeping local `eng`/`osd` models.
 
 ## Run locally
 
