@@ -29,7 +29,11 @@ services:
       - key: TESSERACT_OEM
         value: "1"
       - key: TESSERACT_PSM_CANDIDATES
-        value: 6,4,11
+        value: 6,4
+      - key: TESSERACT_MAX_VARIANTS
+        value: "4"
+      - key: TESSERACT_CALL_TIMEOUT_SEC
+        value: "12"
       - key: LIGHTON_OCR_ENDPOINT
         sync: false
       - key: LIGHTON_OCR_TOKEN

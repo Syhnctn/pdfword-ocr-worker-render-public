@@ -79,7 +79,7 @@ def tesseract_oem() -> str:
 
 def tesseract_psm_candidates() -> list[str]:
     raw = os.environ.get("TESSERACT_PSM_CANDIDATES", "").strip()
-    values = raw.split(",") if raw else [tesseract_psm(), "4", "11"]
+    values = raw.split(",") if raw else [tesseract_psm(), "4"]
     seen: set[str] = set()
     result: list[str] = []
     for part in values:
@@ -88,7 +88,25 @@ def tesseract_psm_candidates() -> list[str]:
             continue
         seen.add(item)
         result.append(item)
-    return result or ["6", "4", "11"]
+    return result or ["6", "4"]
+
+
+def tesseract_max_variants() -> int:
+    raw = os.environ.get("TESSERACT_MAX_VARIANTS", "4").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 4
+    return max(1, min(value, 12))
+
+
+def tesseract_call_timeout_sec() -> float:
+    raw = os.environ.get("TESSERACT_CALL_TIMEOUT_SEC", "12").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 12.0
+    return max(2.0, min(value, 60.0))
 
 
 def make_supabase_client() -> Client:
@@ -322,7 +340,7 @@ def _build_tesseract_image_variants(image: Any) -> list[tuple[str, Any]]:
             continue
         seen.add(key)
         deduped.append((label, variant))
-    return deduped
+    return deduped[: tesseract_max_variants()]
 
 
 def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
@@ -346,6 +364,16 @@ def _ocr_candidate_score(text: str, mean_confidence: float) -> float:
     )
 
 
+def _ocr_candidate_good_enough(text: str, mean_confidence: float) -> bool:
+    normalized = normalize_extracted_text(text)
+    if len(normalized) < 48:
+        return False
+    if mean_confidence >= 75:
+        return True
+    turkish_hits = sum(normalized.count(ch) for ch in _TURKISH_CHARS)
+    return turkish_hits >= 3 and mean_confidence >= 50
+
+
 def _tesseract_config(psm: str) -> str:
     return (
         f"--oem {tesseract_oem()} --psm {psm} "
@@ -358,6 +386,7 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
         return "", -1.0
 
     config = _tesseract_config(psm)
+    timeout_sec = tesseract_call_timeout_sec()
 
     text = ""
     mean_conf = -1.0
@@ -369,6 +398,7 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
                 lang=lang,
                 config=config,
                 output_type=Output.DICT,
+                timeout=timeout_sec,
             )
             tokens: list[str] = []
             confs: list[float] = []
@@ -391,6 +421,10 @@ def _run_tesseract_candidate(image: Any, lang: str, psm: str) -> tuple[str, floa
 
     if not text:
         try:
+            text = pytesseract.image_to_string(
+                image, lang=lang, config=config, timeout=timeout_sec
+            )
+        except TypeError:
             text = pytesseract.image_to_string(image, lang=lang, config=config)
         except Exception:
             text = ""
@@ -423,6 +457,7 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                 best_score = -1e9
                 best_variant: Any | None = None
                 best_psm = psm_candidates[0] if psm_candidates else "6"
+                stop_early = False
 
                 for _, variant in _build_tesseract_image_variants(image):
                     for psm in psm_candidates:
@@ -435,6 +470,11 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                             best_text = candidate_text
                             best_variant = variant
                             best_psm = psm
+                        if _ocr_candidate_good_enough(candidate_text, candidate_conf):
+                            stop_early = True
+                            break
+                    if stop_early:
+                        break
 
                 if not best_text.strip():
                     raise RuntimeError("tesseract_ocr_empty_result")
@@ -445,6 +485,7 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
                             best_variant,
                             lang=lang,
                             config=_tesseract_config(best_psm),
+                            timeout=tesseract_call_timeout_sec(),
                         )
                         if pretty.strip():
                             raw = pretty
