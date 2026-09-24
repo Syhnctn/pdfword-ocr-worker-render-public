@@ -1,4 +1,5 @@
-﻿import io
+﻿import base64
+import io
 import os
 import re
 import signal
@@ -12,15 +13,19 @@ from typing import Any
 
 import httpx
 from docx import Document
-from fastapi import FastAPI, HTTPException, Request
+from docx.shared import Inches, Pt, RGBColor
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from pypdf import PdfReader
 from supabase import Client, create_client
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz  # PyMuPDF (modern package name)
 except Exception:  # pragma: no cover - optional dependency
-    fitz = None
+    try:
+        import fitz  # legacy PyMuPDF module name
+    except Exception:  # pragma: no cover - optional dependency
+        fitz = None
 
 try:
     import pytesseract
@@ -34,13 +39,16 @@ except Exception:  # pragma: no cover - optional dependency
     ImageFilter = None
     ImageOps = None
 
-app = FastAPI(title="pdfword-ocr-worker", version="0.2.0")
+app = FastAPI(title="pdfword-ocr-worker", version="0.3.0")
 
 _BULLET_RE = re.compile(r"^([\-*]|\d+[.)])\s+")
 _MULTISPACE_RE = re.compile(r"\s+")
 _PUNCT_END_RE = re.compile(r"[.!?:;)](?:['\"])?$")
 _HEADING_RE = re.compile(r"^[A-Z0-9][A-Z0-9\s/&()_-]{2,}$")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+_PAGEBREAK_MARKER = "<!-- pagebreak -->"
+
 _TURKISH_CHARS = "\u00e7\u011f\u0131\u00f6\u015f\u00fc\u00c7\u011e\u0130\u00d6\u015e\u00dc"
 
 
@@ -574,6 +582,14 @@ def normalize_extracted_text(raw_text: str) -> str:
 
 
 def extract_pdf_text_sections(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    # Structural extraction first (headings, lists, tables); pypdf is fallback.
+    sections = _extract_sections_with_fitz(pdf_bytes)
+    if sections:
+        return sections
+    return _extract_sections_with_pypdf(pdf_bytes)
+
+
+def _extract_sections_with_pypdf(pdf_bytes: bytes) -> list[tuple[int, str]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     if reader.is_encrypted:
         try:
@@ -588,6 +604,304 @@ def extract_pdf_text_sections(pdf_bytes: bytes) -> list[tuple[int, str]]:
         if text:
             sections.append((page_index, text))
 
+    return sections
+
+
+_LIST_LINE_RE = re.compile(r"^(?:[-–—*•◦▪‣·]+|\d+[.)])(?:\s+|$)")
+_MD_HEADING_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _fitz_is_bold(span: dict[str, Any]) -> bool:
+    font = str(span.get("font") or "").lower()
+    if any(
+        token in font
+        for token in ("bold", "black", "heavy", "semibold", "demibold", "-bd")
+    ):
+        return True
+    # PyMuPDF: bit 16 == bold.
+    return bool(int(span.get("flags") or 0) & 16)
+
+
+def _fitz_is_italic(span: dict[str, Any]) -> bool:
+    font = str(span.get("font") or "").lower()
+    if "italic" in font or "oblique" in font:
+        return True
+    # PyMuPDF: bit 2 == italic.
+    return bool(int(span.get("flags") or 0) & 2)
+
+
+def _fitz_block_metrics(block: dict[str, Any]) -> tuple[float, float]:
+    weighted: dict[float, int] = {}
+    bold_chars = 0
+    total_chars = 0
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            sample = str(span.get("text") or "")
+            chars = len(sample.strip())
+            if not chars:
+                continue
+            size = round(float(span.get("size") or 0.0), 1)
+            if size <= 0:
+                continue
+            weighted[size] = weighted.get(size, 0) + chars
+            total_chars += chars
+            if _fitz_is_bold(span):
+                bold_chars += chars
+    if not weighted:
+        return 0.0, 0.0
+    dominant = max(weighted.items(), key=lambda kv: kv[1])[0]
+    bold_ratio = (bold_chars / total_chars) if total_chars else 0.0
+    return dominant, bold_ratio
+
+
+def _fitz_render_span(span: dict[str, Any]) -> str:
+    text = _MULTISPACE_RE.sub(" ", str(span.get("text") or ""))
+    if not text.strip():
+        return ""
+    leading = text[: len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()):]
+    core = text.strip()
+    bold = _fitz_is_bold(span)
+    italic = _fitz_is_italic(span)
+    if bold and italic:
+        core = f"***{core}***"
+    elif bold:
+        core = f"**{core}**"
+    elif italic:
+        core = f"*{core}*"
+    return f"{leading}{core}{trailing}"
+
+
+def _fitz_render_line(line: dict[str, Any]) -> str:
+    rendered = "".join(_fitz_render_span(span) for span in line.get("spans", []))
+    return _MULTISPACE_RE.sub(" ", rendered).strip()
+
+
+def _fitz_canonical_list_line(text: str) -> str:
+    ordered = re.match(r"^(\d+)[.)]\s+(.*)$", text)
+    if ordered:
+        return f"{ordered.group(1)}. {ordered.group(2)}"
+    bulletless = _LIST_LINE_RE.sub("", text, count=1).strip()
+    return f"- {bulletless}" if bulletless else ""
+
+
+def _fitz_join_lines(lines: list[str]) -> str:
+    result = ""
+    for line in lines:
+        if not line:
+            continue
+        if not result:
+            result = line
+        elif (
+            result.endswith("-")
+            and not line[0].isupper()
+            and not _LIST_LINE_RE.match(line)
+        ):
+            result = result[:-1] + line
+        else:
+            result = f"{result} {line}"
+    return result.strip()
+
+
+def _fitz_render_block(block: dict[str, Any], body_size: float) -> list[str]:
+    raw_lines = [_fitz_render_line(line) for line in block.get("lines", [])]
+    lines = [line for line in raw_lines if line]
+    if not lines:
+        return []
+
+    list_lines = [line for line in lines if _LIST_LINE_RE.match(line)]
+    if list_lines and len(list_lines) >= len(lines):
+        rendered: list[str] = []
+        for line in lines:
+            canonical = _fitz_canonical_list_line(line)
+            if canonical:
+                rendered.append(canonical)
+        return rendered
+
+    text = _fitz_join_lines(lines)
+    if not text:
+        return []
+
+    # Heading detection: size relative to the dominant body size, short
+    # content, and no sentence-ending punctuation.
+    size, bold_ratio = _fitz_block_metrics(block)
+    ratio = (size / body_size) if body_size > 0 else 1.0
+    plain = _MD_HEADING_BOLD_RE.sub(r"\1", text)
+    short = len(plain) <= 120
+    has_alpha = any(ch.isalpha() for ch in plain)
+    all_caps = has_alpha and plain.upper() == plain and len(plain) <= 90
+    if short and not _PUNCT_END_RE.search(plain):
+        if ratio >= 1.45:
+            return [f"# {plain}"]
+        if ratio >= 1.2:
+            return [f"## {plain}"]
+        if ratio >= 1.05 and (all_caps or bold_ratio >= 0.75):
+            return [f"### {plain}"]
+    return [text]
+
+
+def _fitz_overlap_ratio(
+    box: tuple[float, float, float, float],
+    other: tuple[float, float, float, float],
+) -> float:
+    width = max(box[2] - box[0], 0.0)
+    height = max(box[3] - box[1], 0.0)
+    area = width * height
+    if area <= 0:
+        return 0.0
+    inter_w = min(box[2], other[2]) - max(box[0], other[0])
+    inter_h = min(box[3], other[3]) - max(box[1], other[1])
+    if inter_w <= 0 or inter_h <= 0:
+        return 0.0
+    return (inter_w * inter_h) / area
+
+
+def _fitz_table_markdown(rows: list[list[Any]]) -> str:
+    cleaned: list[list[str]] = []
+    for row in rows:
+        cells = [
+            _MULTISPACE_RE.sub(" ", str(cell or "")).strip().replace("|", "\\|")
+            for cell in row
+        ]
+        if any(cells):
+            cleaned.append(cells)
+    if len(cleaned) < 2:
+        return ""
+    width = max(len(row) for row in cleaned)
+    cleaned = [row + [""] * (width - len(row)) for row in cleaned]
+    lines = [
+        "| " + " | ".join(cleaned[0]) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    for row in cleaned[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _fitz_page_tables(page: Any) -> list[tuple[tuple[float, ...], str]]:
+    try:
+        finder = page.find_tables()
+        candidates = list(getattr(finder, "tables", None) or [])
+    except Exception:
+        return []
+    tables: list[tuple[tuple[float, ...], str]] = []
+    for candidate in candidates:
+        try:
+            rows = candidate.extract()
+            bbox = tuple(candidate.bbox)
+        except Exception:
+            continue
+        markdown = _fitz_table_markdown(rows)
+        if markdown:
+            tables.append((bbox, markdown))
+    return tables
+
+
+def _fitz_page_markdown(page: Any, body_size: float) -> str:
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return ""
+
+    tables = _fitz_page_tables(page)
+    table_boxes = [bbox for bbox, _ in tables]
+
+    text_items: list[tuple[tuple[float, ...], str]] = []
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        bbox = tuple(block.get("bbox") or (0.0, 0.0, 0.0, 0.0))
+        if any(_fitz_overlap_ratio(bbox, box) > 0.2 for box in table_boxes):
+            # Cell text inside an extracted table is already part of it.
+            continue
+        rendered = _fitz_render_block(block, body_size)
+        if rendered:
+            text_items.append((bbox, "\n\n".join(rendered)))
+
+    parts: list[str] = []
+    pending_tables = sorted(
+        tables, key=lambda item: (item[0][1] + item[0][3]) / 2
+    )
+    table_index = 0
+    for bbox, markdown in text_items:
+        center = (bbox[1] + bbox[3]) / 2
+        while (
+            table_index < len(pending_tables)
+            and (pending_tables[table_index][0][1] + pending_tables[table_index][0][3]) / 2
+            < center
+        ):
+            parts.append(pending_tables[table_index][1])
+            table_index += 1
+        parts.append(markdown)
+    while table_index < len(pending_tables):
+        parts.append(pending_tables[table_index][1])
+        table_index += 1
+
+    return "\n\n".join(parts).strip()
+
+
+def _fitz_body_size(document: Any) -> float:
+    weights: dict[float, int] = {}
+    try:
+        page_count = int(document.page_count)
+    except Exception:
+        page_count = 0
+    for page_index in range(min(page_count, 3)):
+        try:
+            data = document[page_index].get_text("dict")
+        except Exception:
+            continue
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    sample = str(span.get("text") or "").strip()
+                    if len(sample) < 3:
+                        continue
+                    size = round(float(span.get("size") or 0.0), 1)
+                    if size <= 0:
+                        continue
+                    weights[size] = weights.get(size, 0) + len(sample)
+    if not weights:
+        return 0.0
+    return max(weights.items(), key=lambda kv: kv[1])[0]
+
+
+def _extract_sections_with_fitz(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    if fitz is None:
+        return []
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return []
+
+    sections: list[tuple[int, str]] = []
+    try:
+        if document.needs_pass:
+            try:
+                if not document.authenticate(""):
+                    return []
+            except Exception:
+                return []
+        body_size = _fitz_body_size(document)
+        try:
+            page_count = int(document.page_count)
+        except Exception:
+            page_count = 0
+        for page_index in range(page_count):
+            try:
+                page = document[page_index]
+                markdown = _fitz_page_markdown(page, body_size)
+            except Exception:
+                markdown = ""
+            if markdown:
+                sections.append((page_index + 1, markdown))
+    finally:
+        try:
+            document.close()
+        except Exception:
+            pass
     return sections
 
 
@@ -1079,37 +1393,46 @@ def download_storage_bytes(sb: Client, bucket: str, path: str) -> bytes:
 
 
 def build_markdown_from_extracted_files(file_results: list[dict[str, Any]]) -> str:
-    lines = ["# OCR Result", ""]
-    lines.append("This output was generated by backend worker.")
-    lines.append("")
+    blocks: list[str] = []
 
     for item in file_results:
         name = str(item.get("name", "unknown.pdf"))
-        lines.append(f"## {name}")
-        lines.append("")
+        lines: list[str] = [f"# {name}", ""]
 
         note = str(item.get("note") or "").strip()
         if note:
-            lines.append(note)
+            lines.append(f"> {note}")
             lines.append("")
 
         sections = item.get("sections") or []
-        if isinstance(sections, list) and sections:
-            multi_page = len(sections) > 1
-            for page_num, text in sections:
-                if multi_page:
-                    lines.append(f"### Page {page_num}")
+        written = False
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, (list, tuple)) or len(section) < 2:
+                    continue
+                text = str(section[1]).strip()
+                if not text:
+                    continue
+                if written:
+                    lines.append(_PAGEBREAK_MARKER)
                     lines.append("")
-                lines.append(str(text))
+                lines.append(text)
                 lines.append("")
-            continue
+                written = True
 
-        lines.append(
-            "No readable embedded text was found in this PDF. It may be scanned/image-based and needs OCR (OCRmyPDF/Tesseract or external OCR)."
-        )
-        lines.append("")
+        if not written:
+            lines.append(
+                "No readable text could be extracted from this file. "
+                "It may be scanned/image-based and needs OCR "
+                "(OPEN_SOURCE_OCR_ENABLED=true)."
+            )
+            lines.append("")
 
-    return "\n".join(lines).strip() + "\n"
+        blocks.append("\n".join(lines).rstrip())
+
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks) + "\n"
 
 
 async def call_lighton_ocr_endpoint(
@@ -1137,23 +1460,208 @@ async def call_lighton_ocr_endpoint(
         return str(data)
 
 
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_BULLET_RE = re.compile(r"^[-*•◦▪‣·]\s+(.*)$")
+_MD_ORDERED_RE = re.compile(r"^(\d+)[.)]\s+(.*)$")
+_MD_PAGEBREAK_RE = re.compile(
+    r"^(?:<!--\s*pagebreak\s*-->|\\pagebreak)$", re.IGNORECASE
+)
+_MD_PAGE_HEADING_RE = re.compile(r"^page\s+\d+$", re.IGNORECASE)
+_MD_HR_RE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+_MD_INLINE_RE = re.compile(
+    r"(\*\*\*.+?\*\*\*|\*\*.+?\*\*|(?<!\\)\*[^*\n]+\*|`[^`\n]+`)"
+)
+
+
+def _split_table_row(row: str) -> list[str]:
+    stripped = row.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip().replace("\\|", "|") for cell in stripped.split("|")]
+
+
+def _is_table_separator(row: str) -> bool:
+    if "|" not in row:
+        return False
+    cells = _split_table_row(row)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+
+
+def _style_run(
+    run: Any,
+    *,
+    bold: bool = False,
+    italic: bool = False,
+    mono: bool = False,
+    muted: bool = False,
+) -> None:
+    if bold:
+        run.bold = True
+    if italic:
+        run.italic = True
+    if mono:
+        run.font.name = "Consolas"
+    if muted:
+        run.font.color.rgb = RGBColor(0x64, 0x74, 0x8B)
+
+
+def _add_inline_runs(paragraph: Any, text: str, **base: bool) -> None:
+    position = 0
+    for match in _MD_INLINE_RE.finditer(text):
+        if match.start() > position:
+            _style_run(paragraph.add_run(text[position : match.start()]), **base)
+        token = match.group(0)
+        if token.startswith("***") and token.endswith("***") and len(token) >= 6:
+            inner, bold, italic, mono = token[3:-3], True, True, False
+        elif token.startswith("**") and token.endswith("**") and len(token) >= 4:
+            inner, bold, italic, mono = token[2:-2], True, False, False
+        elif token.startswith("`") and token.endswith("`") and len(token) >= 2:
+            inner, bold, italic, mono = token[1:-1], False, False, True
+        else:
+            inner, bold, italic, mono = token[1:-1], False, True, False
+        _style_run(
+            paragraph.add_run(inner),
+            bold=bool(base.get("bold")) or bold,
+            italic=bool(base.get("italic")) or italic,
+            mono=bool(base.get("mono")) or mono,
+            muted=bool(base.get("muted")),
+        )
+        position = match.end()
+    if position < len(text):
+        _style_run(paragraph.add_run(text[position:]), **base)
+
+
+def _add_docx_table(document: Any, rows: list[list[str]]) -> None:
+    if not rows:
+        return
+    width = max(len(row) for row in rows)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    table = document.add_table(rows=len(normalized), cols=width)
+    try:
+        table.style = "Table Grid"
+    except Exception:  # pragma: no cover - style may be missing
+        pass
+    for row_index, row_values in enumerate(normalized):
+        cells = table.rows[row_index].cells
+        for column_index, value in enumerate(row_values):
+            if not value:
+                continue
+            paragraph = cells[column_index].paragraphs[0]
+            _add_inline_runs(paragraph, value, bold=row_index == 0)
+    # Word expects a paragraph after a table.
+    document.add_paragraph("")
+
+
+def _configure_docx_styles(document: Any) -> None:
+    try:
+        normal = document.styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(11)
+        normal.paragraph_format.space_after = Pt(6)
+        normal.paragraph_format.line_spacing = 1.15
+    except Exception:  # pragma: no cover - default template dependent
+        pass
+    for level in range(1, 7):
+        try:
+            heading_style = document.styles[f"Heading {level}"]
+            heading_style.font.name = "Calibri"
+            heading_style.font.color.rgb = RGBColor(0x11, 0x18, 0x27)
+        except Exception:  # pragma: no cover - default template dependent
+            pass
+
+
 def markdown_to_docx_bytes(markdown: str) -> bytes:
     document = Document()
-    for raw_line in markdown.splitlines():
-        line = raw_line.strip()
+    _configure_docx_styles(document)
+
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    emitted = False
+    index = 0
+
+    while index < len(lines):
+        line = lines[index].strip()
+
         if not line:
-            document.add_paragraph("")
+            index += 1
             continue
-        if line.startswith("# "):
-            document.add_heading(line[2:], level=1)
-        elif line.startswith("## "):
-            document.add_heading(line[3:], level=2)
-        elif line.startswith("### "):
-            document.add_heading(line[4:], level=3)
-        elif line.startswith("- "):
-            document.add_paragraph(line[2:], style="List Bullet")
-        else:
-            document.add_paragraph(line)
+
+        if (
+            line.startswith("|")
+            and index + 1 < len(lines)
+            and _is_table_separator(lines[index + 1].strip())
+        ):
+            rows = [_split_table_row(line)]
+            index += 2
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                rows.append(_split_table_row(lines[index].strip()))
+                index += 1
+            _add_docx_table(document, rows)
+            emitted = True
+            continue
+
+        if _MD_PAGEBREAK_RE.match(line):
+            if emitted:
+                document.add_page_break()
+            index += 1
+            continue
+
+        if _MD_HR_RE.match(line):
+            index += 1
+            continue
+
+        heading_match = _MD_HEADING_RE.match(line)
+        if heading_match:
+            level = min(len(heading_match.group(1)), 6)
+            content = heading_match.group(2).strip()
+            if _MD_PAGE_HEADING_RE.match(content):
+                # Legacy "### Page N" headings become real page breaks.
+                if emitted:
+                    document.add_page_break()
+            else:
+                paragraph = document.add_paragraph(style=f"Heading {level}")
+                _add_inline_runs(paragraph, content)
+                emitted = True
+            index += 1
+            continue
+
+        bullet_match = _MD_BULLET_RE.match(line)
+        if bullet_match:
+            paragraph = document.add_paragraph(style="List Bullet")
+            _add_inline_runs(paragraph, bullet_match.group(1).strip())
+            emitted = True
+            index += 1
+            continue
+
+        ordered_match = _MD_ORDERED_RE.match(line)
+        if ordered_match:
+            paragraph = document.add_paragraph(style="List Number")
+            _add_inline_runs(paragraph, ordered_match.group(2).strip())
+            emitted = True
+            index += 1
+            continue
+
+        if line.startswith(">"):
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.left_indent = Inches(0.4)
+            _add_inline_runs(
+                paragraph,
+                line.lstrip(">").strip(),
+                italic=True,
+                muted=True,
+            )
+            emitted = True
+            index += 1
+            continue
+
+        paragraph = document.add_paragraph()
+        _add_inline_runs(paragraph, line)
+        emitted = True
+        index += 1
+
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -1180,6 +1688,46 @@ def upload_outputs(
         },
     )
     return md_path, docx_path
+
+
+def extract_sections_for_pdf(
+    pdf_bytes: bytes, use_oss_ocr: bool | None = None
+) -> tuple[list[tuple[int, str]], str]:
+    """Extract per-page text sections with optional open-source OCR fallback.
+
+    Returns ``(sections, note)`` where ``note`` describes which OCR path was
+    used (empty when embedded text was read directly).
+    """
+    if use_oss_ocr is None:
+        use_oss_ocr = open_source_ocr_enabled()
+
+    sections = extract_pdf_text_sections(pdf_bytes)
+    note = ""
+    if sections or not use_oss_ocr:
+        return sections, note
+
+    ocr_errors: list[str] = []
+
+    if ocrmypdf_enabled():
+        try:
+            sections = extract_pdf_text_sections_with_ocrmypdf(pdf_bytes)
+            if sections:
+                note = "Extracted with open-source OCR (OCRmyPDF + Tesseract)."
+        except Exception as exc:  # pragma: no cover - env dependent
+            ocr_errors.append(f"OCRmyPDF unavailable: {exc}")
+
+    if not sections:
+        try:
+            sections = extract_pdf_text_sections_with_tesseract(pdf_bytes)
+            if sections:
+                note = "Extracted with open-source OCR (Tesseract fallback)."
+        except Exception as exc:  # pragma: no cover - env dependent
+            ocr_errors.append(f"Tesseract OCR unavailable: {exc}")
+
+    if not sections and ocr_errors:
+        note = " | ".join(ocr_errors[:2])
+
+    return sections, note
 
 
 async def process_job(job_id: str) -> dict[str, Any]:
@@ -1231,30 +1779,9 @@ async def process_job(job_id: str) -> dict[str, Any]:
 
             try:
                 pdf_bytes = download_storage_bytes(sb, bucket, path)
-                sections = extract_pdf_text_sections(pdf_bytes)
-                note = ""
-
-                if not sections and use_oss_ocr:
-                    ocr_errors: list[str] = []
-
-                    if ocrmypdf_enabled():
-                        try:
-                            sections = extract_pdf_text_sections_with_ocrmypdf(pdf_bytes)
-                            if sections:
-                                note = "Extracted with open-source OCR (OCRmyPDF + Tesseract)."
-                        except Exception as exc:  # pragma: no cover - env dependent
-                            ocr_errors.append(f"OCRmyPDF unavailable: {exc}")
-
-                    if not sections:
-                        try:
-                            sections = extract_pdf_text_sections_with_tesseract(pdf_bytes)
-                            if sections:
-                                note = "Extracted with open-source OCR (Tesseract fallback)."
-                        except Exception as exc:  # pragma: no cover - env dependent
-                            ocr_errors.append(f"Tesseract OCR unavailable: {exc}")
-
-                    if not sections and ocr_errors:
-                        note = " | ".join(ocr_errors[:2])
+                sections, note = extract_sections_for_pdf(
+                    pdf_bytes, use_oss_ocr=use_oss_ocr
+                )
 
                 has_local_text = has_local_text or bool(sections)
                 item: dict[str, Any] = {"name": name, "sections": sections}
@@ -1343,4 +1870,150 @@ async def process(request: Request, payload: ProcessRequest) -> dict[str, Any]:
 async def process_with_path(job_id: str, request: Request) -> dict[str, Any]:
     assert_worker_secret(request)
     return await process_job(job_id)
+
+
+@app.post("/internal/convert")
+async def convert_direct(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    job_id: str = Form(""),
+    source: str = Form("flutter_app"),
+) -> dict[str, Any]:
+    """Convert uploaded PDF bytes directly (no storage download needed).
+
+    Persists job + artifacts when Supabase credentials are configured;
+    otherwise returns ``docx_base64`` so the client can keep the result.
+    """
+    assert_worker_secret(request)
+    if not files:
+        raise HTTPException(status_code=400, detail="files_required")
+
+    payloads: list[tuple[str, str, bytes]] = []
+    for index, upload in enumerate(files):
+        data = await upload.read()
+        if not data:
+            continue
+        name = (upload.filename or "").strip() or f"input-{index}.pdf"
+        payloads.append((name, upload.content_type or "application/pdf", data))
+    if not payloads:
+        raise HTTPException(status_code=400, detail="empty_files")
+
+    input_meta: list[dict[str, Any]] = [
+        {
+            "file_id": f"direct-{index}",
+            "name": name,
+            "mime_type": mime_type,
+            "size_mb": round(len(data) / (1024 * 1024), 3),
+            "state": "ready",
+        }
+        for index, (name, mime_type, data) in enumerate(payloads)
+    ]
+    total_size_mb = round(
+        sum(len(data) for _, _, data in payloads) / (1024 * 1024), 3
+    )
+
+    try:
+        sb = make_supabase_client()
+    except Exception:  # pragma: no cover - depends on env
+        sb = None
+
+    active_job_id = (job_id or "").strip()
+    if sb is not None:
+        if active_job_id:
+            row = (
+                sb.table("ocr_jobs")
+                .select("id")
+                .eq("id", active_job_id)
+                .limit(1)
+                .execute()
+            )
+            if not row.data:
+                raise HTTPException(status_code=404, detail="job_not_found")
+            patch: dict[str, Any] = {
+                "status": "processing",
+                "progress_pct": 30,
+                "started_at": utc_now(),
+                "input_meta": input_meta,
+                "total_size_mb": total_size_mb,
+            }
+            sb.table("ocr_jobs").update(patch).eq("id", active_job_id).execute()
+        else:
+            insert = (
+                sb.table("ocr_jobs")
+                .insert(
+                    {
+                        "source": source,
+                        "status": "processing",
+                        "progress_pct": 30,
+                        "started_at": utc_now(),
+                        "input_meta": input_meta,
+                        "total_size_mb": total_size_mb,
+                    }
+                )
+                .select("id")
+                .single()
+                .execute()
+            )
+            active_job_id = str(insert.data["id"])
+
+    try:
+        extracted: list[dict[str, Any]] = []
+        for index, (name, _mime, data) in enumerate(payloads):
+            sections, note = extract_sections_for_pdf(data)
+            item: dict[str, Any] = {"name": name, "sections": sections}
+            if note:
+                item["note"] = note
+            extracted.append(item)
+            if sb is not None and active_job_id:
+                pct = 40 + int(((index + 1) / len(payloads)) * 35)
+                (
+                    sb.table("ocr_jobs")
+                    .update({"progress_pct": pct})
+                    .eq("id", active_job_id)
+                    .execute()
+                )
+
+        markdown = build_markdown_from_extracted_files(extracted)
+        if not markdown.strip():
+            markdown = build_placeholder_markdown(input_meta)
+
+        docx_bytes = markdown_to_docx_bytes(markdown)
+        result: dict[str, Any] = {
+            "job_id": active_job_id or None,
+            "status": "succeeded",
+            "file_count": len(payloads),
+        }
+
+        if sb is not None and active_job_id:
+            md_path, docx_path = upload_outputs(
+                sb, active_job_id, markdown, docx_bytes
+            )
+            done = {
+                "status": "succeeded",
+                "progress_pct": 100,
+                "output_md_path": md_path,
+                "output_docx_path": docx_path,
+                "finished_at": utc_now(),
+            }
+            sb.table("ocr_jobs").update(done).eq("id", active_job_id).execute()
+            result["output_md_path"] = md_path
+            result["output_docx_path"] = docx_path
+        else:
+            result["docx_base64"] = base64.b64encode(docx_bytes).decode("ascii")
+            result["markdown"] = markdown
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if sb is not None and active_job_id:
+            failed = {
+                "status": "failed",
+                "progress_pct": 100,
+                "error_code": "direct_convert_error",
+                "error_message": str(exc),
+                "finished_at": utc_now(),
+            }
+            sb.table("ocr_jobs").update(failed).eq("id", active_job_id).execute()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
