@@ -97,11 +97,15 @@ def tesseract_final_lang_candidates() -> list[str]:
 
 
 def tesseract_dpi() -> int:
-    raw = os.environ.get("TESSERACT_DPI", "300").strip()
+    # 300 dpi renders an A4 page as 2481x3507 (~25 MB in RGB). With the derived
+    # image variants and Tesseract's own allocations that peaks past the 512 MB
+    # free tier on multi-page scans, which killed the worker with 502/503.
+    # 200 dpi still reads normal body text and print accurately.
+    raw = os.environ.get("TESSERACT_DPI", "200").strip()
     try:
         dpi = int(raw)
     except ValueError:
-        dpi = 300
+        dpi = 200
     return max(96, min(dpi, 600))
 
 
@@ -1395,6 +1399,10 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
             page = doc.load_page(page_index)
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             image = Image.open(io.BytesIO(pix.tobytes("png")))
+            # Variants hold their own pixel buffers. Without releasing them the
+            # 300 dpi pages of a multi-page scan accumulated until the process
+            # was killed on the 512 MB free tier, which surfaced as 502/503.
+            variants: list[tuple[str, Any]] = []
             try:
                 best_text = ""
                 best_score = -1e9
@@ -1479,7 +1487,17 @@ def extract_pdf_text_sections_with_tesseract(pdf_bytes: bytes) -> list[tuple[int
             except Exception as exc:  # pragma: no cover - tesseract specific
                 raise RuntimeError(f"tesseract_ocr_failed:{exc}") from exc
             finally:
-                image.close()
+                for _, variant in variants:
+                    try:
+                        if variant is not image:
+                            variant.close()
+                    except Exception:
+                        pass
+                try:
+                    pix = None
+                    image.close()
+                except Exception:
+                    pass
 
             text = normalize_extracted_text(raw or "")
             if text:

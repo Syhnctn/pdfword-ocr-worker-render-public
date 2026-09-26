@@ -43,11 +43,15 @@ services:
       - key: TESSERACT_LANG
         value: tur
       - key: TESSERACT_DPI
-        value: "300"
+        value: "200"
       - key: TESSERACT_PSM
         value: "6"
       - key: TESSERACT_OEM
         value: "1"
+      # A single scanned page took ~65s on the free tier because this pair
+      # allows up to 6 Tesseract passes per page (2 PSM x 3 variants). One
+      # page-segmentation mode with a single variant keeps quality while
+      # cutting the per-page cost enough to stay well inside app timeouts.
       - key: TESSERACT_PSM_CANDIDATES
         value: "6"
       - key: TESSERACT_MAX_VARIANTS
