@@ -942,6 +942,99 @@ def _ocrmypdf_cli_args(
     return args
 
 
+def _split_pdf_for_ocrmypdf(pdf_bytes: bytes, temp_dir: str) -> list[str]:
+    """Write the PDF to single-page files, or return the whole file as one chunk.
+
+    Multi-page documents are the ones that exceed the free tier's memory, so
+    they are processed page by page. A document PyMuPDF cannot open is passed
+    through untouched as a single chunk.
+    """
+    whole_path = os.path.join(temp_dir, "input.pdf")
+    if fitz is None:
+        return [whole_path]
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return [whole_path]
+
+    try:
+        if doc.page_count <= 1:
+            return [whole_path]
+
+        chunks: list[str] = []
+        for index in range(doc.page_count):
+            single = fitz.open()
+            try:
+                single.insert_pdf(doc, from_page=index, to_page=index)
+                chunk_path = os.path.join(temp_dir, f"chunk-{index:03d}.pdf")
+                single.save(chunk_path)
+                chunks.append(chunk_path)
+            finally:
+                single.close()
+        return chunks or [whole_path]
+    except Exception:
+        return [whole_path]
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _append_ocrmypdf_outputs(
+    page_pdf: str, page_sidecar: str, output_path: str, sidecar_path: str
+) -> bool:
+    """Append one OCR'd page PDF and its sidecar text to the merged outputs."""
+    if not os.path.exists(page_pdf):
+        return False
+
+    if os.path.exists(page_sidecar):
+        try:
+            with open(page_sidecar, "r", encoding="utf-8", errors="replace") as f:
+                text_chunk = f.read()
+            if text_chunk.strip():
+                mode = "a" if os.path.exists(sidecar_path) else "w"
+                with open(sidecar_path, mode, encoding="utf-8") as f:
+                    f.write(text_chunk)
+                    if not text_chunk.endswith("\n"):
+                        f.write("\n")
+                    f.write("\f\n")
+        except Exception:
+            pass
+
+    if fitz is None:
+        if os.path.exists(output_path):
+            return False
+        try:
+            with open(page_pdf, "rb") as src, open(output_path, "wb") as dst:
+                dst.write(src.read())
+        except Exception:
+            return False
+        return True
+
+    tmp_path = output_path + ".tmp"
+    try:
+        merged = fitz.open(output_path) if os.path.exists(output_path) else fitz.open()
+        addition = fitz.open(page_pdf)
+        try:
+            merged.insert_pdf(addition)
+            merged.save(tmp_path)
+        finally:
+            merged.close()
+            addition.close()
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+    return True
+
+
 def _run_subprocess_text(
     args: list[str], timeout_sec: float, env: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
@@ -995,6 +1088,12 @@ def _run_subprocess_text(
 
 
 def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    """OCR a PDF with OCRmyPDF, one page at a time.
+
+    OCRmyPDF rasterises every page in a single pass. On the 512 MB free tier
+    that is what pushed multi-page scans over the limit and surfaced as
+    502/503, so documents are split into single pages, OCR'd, then merged.
+    """
     timeout_sec = ocrmypdf_timeout_sec()
 
     with tempfile.TemporaryDirectory(prefix="ocrmypdf_") as temp_dir:
@@ -1005,7 +1104,7 @@ def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int,
         with open(input_path, "wb") as f:
             f.write(pdf_bytes)
 
-        args = _ocrmypdf_cli_args(input_path, output_path, sidecar_path)
+        page_chunks = _split_pdf_for_ocrmypdf(pdf_bytes, temp_dir)
         print(
             "[ocrmypdf:start]",
             {
@@ -1015,15 +1114,37 @@ def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int,
                 "rotate_pages": ocrmypdf_rotate_pages(),
                 "deskew": ocrmypdf_deskew(),
                 "force_ocr": ocrmypdf_force_ocr(),
+                "pages": len(page_chunks),
             },
         )
         started = time.monotonic()
         try:
-            result = _run_subprocess_text(
-                args=args,
-                timeout_sec=timeout_sec,
-                env=_ocrmypdf_subprocess_env(),
-            )
+            merged_any = False
+            for index, chunk_path in enumerate(page_chunks):
+                page_output = os.path.join(temp_dir, f"page-{index:03d}.pdf")
+                page_sidecar = os.path.join(temp_dir, f"page-{index:03d}.txt")
+                args = _ocrmypdf_cli_args(chunk_path, page_output, page_sidecar)
+                result = _run_subprocess_text(
+                    args=args,
+                    timeout_sec=timeout_sec,
+                    env=_ocrmypdf_subprocess_env(),
+                )
+                if result.returncode != 0:
+                    stderr = (result.stderr or "").strip()
+                    stdout = (result.stdout or "").strip()
+                    message = stderr or stdout or f"exit_code={result.returncode}"
+                    message = _MULTISPACE_RE.sub(" ", message).strip()
+                    if len(message) > 240:
+                        message = message[:240].rstrip() + "..."
+                    raise RuntimeError(f"ocrmypdf_cli_failed:{message}")
+
+                if _append_ocrmypdf_outputs(
+                    page_output, page_sidecar, output_path, sidecar_path
+                ):
+                    merged_any = True
+
+            if not merged_any:
+                raise RuntimeError("ocrmypdf_empty_result")
         except FileNotFoundError as exc:
             raise RuntimeError("ocrmypdf_not_installed") from exc
         except RuntimeError as exc:
@@ -1034,15 +1155,6 @@ def extract_pdf_text_sections_with_ocrmypdf(pdf_bytes: bytes) -> list[tuple[int,
             raise RuntimeError(f"ocrmypdf_failed:{exc}") from exc
         finally:
             print("[ocrmypdf:end]", {"elapsed_sec": round(time.monotonic() - started, 2)})
-
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            stdout = (result.stdout or "").strip()
-            message = stderr or stdout or f"exit_code={result.returncode}"
-            message = _MULTISPACE_RE.sub(" ", message).strip()
-            if len(message) > 240:
-                message = message[:240].rstrip() + "..."
-            raise RuntimeError(f"ocrmypdf_cli_failed:{message}")
 
         sections: list[tuple[int, str]] = []
         if os.path.exists(output_path):
@@ -1121,29 +1233,32 @@ def _build_tesseract_image_variants(image: Any) -> list[tuple[str, Any]]:
     if Image is None:
         return [("raw", image)]
 
-    gray = image.convert("L")
-    variants: list[tuple[str, Any]] = []
+    # The free Render tier gives 512 MB, and a 300 dpi A4 page is 2481x3507 px.
+    # Holding every derived variant (plus a 2x upscale) alive at once pushed the
+    # process past the limit on multi-page scans, which surfaced as 502/503.
+    # Building them one at a time keeps peak memory to the page itself.
+    def _variants() -> Any:
+        gray = image.convert("L")
+        auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
+        yield "gray_auto", auto
+        yield "gray", gray
 
-    auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
-    variants.append(("gray_auto", auto))
-    variants.append(("gray", gray))
+        if ImageFilter is not None:
+            denoised = auto.filter(ImageFilter.MedianFilter(size=3))
+            yield "gray_auto_median", denoised
+        yield "binary_auto", _binarize_luma(auto)
+        if ImageFilter is not None:
+            yield "binary_auto_median", _binarize_luma(denoised)
 
-    if ImageFilter is not None:
-        denoised = auto.filter(ImageFilter.MedianFilter(size=3))
-        variants.append(("gray_auto_median", denoised))
-    variants.append(("binary_auto", _binarize_luma(auto)))
-    if ImageFilter is not None:
-        variants.append(("binary_auto_median", _binarize_luma(denoised)))
-
-    width, height = auto.size
-    if max(width, height) < 2600:
-        upscaled = auto.resize((width * 2, height * 2), _lanczos_resample())
-        variants.append(("gray_auto_2x", upscaled))
-        variants.append(("binary_auto_2x", _binarize_luma(upscaled)))
+        width, height = auto.size
+        if max(width, height) < 2600:
+            upscaled = auto.resize((width * 2, height * 2), _lanczos_resample())
+            yield "gray_auto_2x", upscaled
+            yield "binary_auto_2x", _binarize_luma(upscaled)
 
     deduped: list[tuple[str, Any]] = []
     seen = set()
-    for label, variant in variants:
+    for label, variant in _variants():
         key = (label, getattr(variant, "mode", ""), getattr(variant, "size", None))
         if key in seen:
             continue
