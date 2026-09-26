@@ -1828,14 +1828,16 @@ def upload_outputs(
 def ocr_chunk_pages() -> int:
     """How many pages each OCR subprocess handles at once.
 
-    Measured on the 512 MB free tier: 1 and 2 pages succeed, 3+ gets killed
-    mid-run. Two pages is the largest group that reliably fits.
+    Measured on the 512 MB free tier: a single page succeeds (~28s), two pages
+    only just fit and are close to the edge, three pages are killed mid-run
+    (the container dies and the load balancer returns 502/503). One page per
+    process is the only size that reliably survives.
     """
-    raw = os.environ.get("OCR_CHUNK_PAGES", "2").strip()
+    raw = os.environ.get("OCR_CHUNK_PAGES", "1").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 2
+        value = 1
     return max(1, min(value, 20))
 
 

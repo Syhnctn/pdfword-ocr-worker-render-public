@@ -19,12 +19,11 @@ from docx import Document as DocxDocument
 import main as worker
 
 
-def build_two_page_sample() -> str:
-    """A two-page text PDF written to a temp file; returns its path."""
+def build_one_page_sample() -> str:
+    """A one-page text PDF written to a temp file; returns its path."""
     document = pymupdf.open()
-    for index in range(2):
-        page = document.new_page(width=595, height=842)
-        page.insert_text((72, 100), f"Sayfa {index + 1} icerik metni", fontsize=20)
+    page = document.new_page(width=595, height=842)
+    page.insert_text((72, 100), "Tek sayfa icerik metni", fontsize=20)
     pdf_bytes = document.tobytes()
     document.close()
 
@@ -232,7 +231,7 @@ def main() -> int:
         worker.fitz = original_fitz
 
     # --- chunked OCR (page-group subprocesses) -------------------------
-    check(worker.ocr_chunk_pages() == 2, "default chunk size is 2 pages")
+    check(worker.ocr_chunk_pages() == 1, "default chunk size is 1 page")
 
     multi_page = pymupdf.open()
     for index in range(5):
@@ -245,22 +244,20 @@ def main() -> int:
         source = pathlib.Path(work_dir) / "source.pdf"
         source.write_bytes(multi_pdf)
         sizes: list[int] = []
-        for group_index in range(3):
-            chunk = pathlib.Path(work_dir) / f"group-{group_index}.pdf"
-            written = worker._write_pdf_slice(
-                str(source), str(chunk), group_index * 2, 2
-            )
+        for page_index in range(5):
+            chunk = pathlib.Path(work_dir) / f"page-{page_index}.pdf"
+            written = worker._write_pdf_slice(str(source), str(chunk), page_index, 1)
             sizes.append(pymupdf.open(chunk).page_count if written else -1)
-        check(sizes == [2, 2, 1], "5 pages split into page groups of 2, 2, 1")
+        check(sizes == [1, 1, 1, 1, 1], "5 pages split into five single-page files")
 
-    chunk_result = worker._run_ocr_subprocess(build_two_page_sample(), 120.0)
+    chunk_result = worker._run_ocr_subprocess(build_one_page_sample(), 120.0)
     check(bool(chunk_result.get("ok")), "isolated OCR subprocess returns a result")
     check(
-        len(chunk_result.get("sections") or []) == 2,
-        "isolated subprocess reports both pages",
+        len(chunk_result.get("sections") or []) == 1,
+        "isolated subprocess reports its single page",
     )
     check(
-        [int(item[0]) for item in (chunk_result.get("sections") or [])] == [1, 2],
+        [int(item[0]) for item in (chunk_result.get("sections") or [])] == [1],
         "isolated subprocess keeps 1-based page numbers",
     )
 
