@@ -1,10 +1,12 @@
 ﻿import base64
 import io
+import json
 import os
 import re
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -1823,6 +1825,207 @@ def upload_outputs(
     return md_path, docx_path
 
 
+def ocr_chunk_pages() -> int:
+    """How many pages each OCR subprocess handles at once.
+
+    Measured on the 512 MB free tier: 1 and 2 pages succeed, 3+ gets killed
+    mid-run. Two pages is the largest group that reliably fits.
+    """
+    raw = os.environ.get("OCR_CHUNK_PAGES", "2").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 2
+    return max(1, min(value, 20))
+
+
+def _write_pdf_slice(source_path: str, out_path: str, start: int, count: int) -> bool:
+    """Copy `count` pages starting at `start` from a PDF into its own file."""
+    if fitz is None:
+        return False
+    try:
+        doc = fitz.open(source_path)
+    except Exception:
+        return False
+    try:
+        if start >= doc.page_count:
+            return False
+        end = min(start + count, doc.page_count)
+        out = fitz.open()
+        try:
+            out.insert_pdf(doc, from_page=start, to_page=end - 1)
+            out.save(out_path)
+        finally:
+            out.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _run_ocr_subprocess(pdf_path: str, timeout_sec: float) -> dict[str, Any]:
+    """OCR one PDF file inside a separate process and return its JSON result."""
+    with tempfile.TemporaryDirectory(prefix="ocr_chunk_") as chunk_dir:
+        out_json = os.path.join(chunk_dir, "result.json")
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        args = [sys.executable, "-m", "ocr_chunk_worker", pdf_path, out_json]
+
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"spawn_failed:{exc}"}
+
+        try:
+            _, stderr = proc.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:  # pragma: no cover - non-POSIX fallback
+                    proc.kill()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            return {"ok": False, "error": f"chunk_timeout:{int(timeout_sec)}s"}
+
+        if not os.path.exists(out_json):
+            tail = _MULTISPACE_RE.sub(" ", (stderr or "").strip())[-240:]
+            return {"ok": False, "error": f"chunk_no_result:{tail}"}
+
+        try:
+            with open(out_json, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            return {"ok": False, "error": f"chunk_bad_json:{exc}"}
+
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "chunk_bad_payload"}
+        return data
+
+
+def extract_sections_via_chunked_subprocess(
+    pdf_bytes: bytes, use_oss_ocr: bool | None = None
+) -> tuple[list[tuple[int, str]], str]:
+    """OCR a document page-group by page-group, each in its own process.
+
+    Each group is written to a temporary PDF, handed to a fresh interpreter
+    (:mod:`ocr_chunk_worker`) and merged afterwards. Because the child exits
+    after every group its rasterised pages and Tesseract allocations go back
+    to the OS, which is what keeps long scans inside the 512 MB budget.
+    Page numbers are offset so the caller's page indices stay correct.
+    """
+    if use_oss_ocr is None:
+        use_oss_ocr = open_source_ocr_enabled()
+
+    if fitz is None:
+        return extract_sections_for_pdf(pdf_bytes, use_oss_ocr=use_oss_ocr)
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise RuntimeError(f"chunked_pdf_open_failed:{exc}") from exc
+
+    try:
+        page_count = doc.page_count
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+    group_size = ocr_chunk_pages()
+    if page_count <= group_size:
+        # Small enough to run in-process; the faster path is fine.
+        return extract_sections_for_pdf(pdf_bytes, use_oss_ocr=use_oss_ocr)
+
+    per_group_timeout = max(120.0, float(ocrmypdf_timeout_sec()) * float(group_size))
+
+    merged: list[tuple[int, str]] = []
+    notes: list[str] = []
+    errors: list[str] = []
+    succeeded_groups = 0
+
+    with tempfile.TemporaryDirectory(prefix="ocr_groups_") as work_dir:
+        source_path = os.path.join(work_dir, "source.pdf")
+        with open(source_path, "wb") as handle:
+            handle.write(pdf_bytes)
+
+        total_groups = (page_count + group_size - 1) // group_size
+        for group_index in range(total_groups):
+            start = group_index * group_size
+            chunk_path = os.path.join(
+                work_dir, f"group-{group_index:03d}-{start:04d}.pdf"
+            )
+            if not _write_pdf_slice(source_path, chunk_path, start, group_size):
+                errors.append(f"chunk_write_failed:page{start + 1}")
+                continue
+
+            result = _run_ocr_subprocess(chunk_path, per_group_timeout)
+            if not result.get("ok"):
+                errors.append(str(result.get("error") or "chunk_failed")[:200])
+                continue
+
+            group_sections = result.get("sections") or []
+            note = str(result.get("note") or "").strip()
+            if note:
+                notes.append(note)
+
+            if not group_sections:
+                errors.append(f"chunk_empty:page{start + 1}")
+                continue
+
+            for item in group_sections:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                try:
+                    local_index = int(item[0])
+                except (TypeError, ValueError):
+                    continue
+                text = str(item[1])
+                if text.strip():
+                    # local_index is 1-based inside the group.
+                    merged.append((start + local_index, text))
+
+            succeeded_groups += 1
+
+    if not merged:
+        detail = " | ".join(errors[:3]) if errors else "no_text_extracted"
+        raise RuntimeError(f"chunked_ocr_empty:{detail}")
+
+    merged.sort(key=lambda item: item[0])
+
+    note = ""
+    if notes:
+        # Every group reports the same OCR method, so collapse duplicates.
+        note = list(dict.fromkeys(notes))[0]
+    if succeeded_groups < total_groups:
+        note = note or "Converted page by page."
+        note = f"{note} Converted page by page ({succeeded_groups}/{total_groups} groups)."
+
+    return merged, note
+
+
 def extract_sections_for_pdf(
     pdf_bytes: bytes, use_oss_ocr: bool | None = None
 ) -> tuple[list[tuple[int, str]], str]:
@@ -1856,6 +2059,18 @@ def extract_sections_for_pdf(
                 note = "Extracted with open-source OCR (Tesseract fallback)."
         except Exception as exc:  # pragma: no cover - env dependent
             ocr_errors.append(f"Tesseract OCR unavailable: {exc}")
+
+    # Long documents are re-tried page-group by page-group in separate
+    # processes: the free tier cannot hold a whole scan in memory at once.
+    if not sections and use_oss_ocr and ocr_errors:
+        try:
+            sections, chunk_note = extract_sections_via_chunked_subprocess(
+                pdf_bytes, use_oss_ocr=use_oss_ocr
+            )
+            if sections:
+                note = chunk_note or "Converted page by page."
+        except Exception as exc:  # pragma: no cover - env dependent
+            ocr_errors.append(f"Chunked OCR unavailable: {exc}")
 
     if not sections and ocr_errors:
         note = " | ".join(ocr_errors[:2])

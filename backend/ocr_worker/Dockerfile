@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     TESSDATA_PREFIX=/opt/tessdata-best
@@ -24,7 +25,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py ocr_chunk_worker.py ./
 
 EXPOSE 8080
 
