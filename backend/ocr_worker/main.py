@@ -11,7 +11,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from docx import Document
@@ -1927,7 +1927,9 @@ def _run_ocr_subprocess(pdf_path: str, timeout_sec: float) -> dict[str, Any]:
 
 
 def extract_sections_via_chunked_subprocess(
-    pdf_bytes: bytes, use_oss_ocr: bool | None = None
+    pdf_bytes: bytes,
+    use_oss_ocr: bool | None = None,
+    on_page_done: Callable[[int, int], None] | None = None,
 ) -> tuple[list[tuple[int, str]], str]:
     """OCR a document page-group by page-group, each in its own process.
 
@@ -1936,6 +1938,10 @@ def extract_sections_via_chunked_subprocess(
     after every group its rasterised pages and Tesseract allocations go back
     to the OS, which is what keeps long scans inside the 512 MB budget.
     Page numbers are offset so the caller's page indices stay correct.
+
+    ``on_page_done`` is invoked as ``(group_index, total_groups)`` before each
+    group runs, which lets the caller report progress while OCR is still the
+    long-running part of the job.
     """
     if use_oss_ocr is None:
         use_oss_ocr = open_source_ocr_enabled()
@@ -1983,6 +1989,9 @@ def extract_sections_via_chunked_subprocess(
                 errors.append(f"chunk_write_failed:page{start + 1}")
                 continue
 
+            if on_page_done is not None:
+                on_page_done(group_index, total_groups)
+
             result = _run_ocr_subprocess(chunk_path, per_group_timeout)
             if not result.get("ok"):
                 errors.append(str(result.get("error") or "chunk_failed")[:200])
@@ -2029,12 +2038,15 @@ def extract_sections_via_chunked_subprocess(
 
 
 def extract_sections_for_pdf(
-    pdf_bytes: bytes, use_oss_ocr: bool | None = None
+    pdf_bytes: bytes,
+    use_oss_ocr: bool | None = None,
+    on_page_done: Callable[[int, int], None] | None = None,
 ) -> tuple[list[tuple[int, str]], str]:
     """Extract per-page text sections with optional open-source OCR fallback.
 
     Returns ``(sections, note)`` where ``note`` describes which OCR path was
-    used (empty when embedded text was read directly).
+    used (empty when embedded text was read directly). ``on_page_done`` is
+    forwarded to the chunked OCR path so progress can be reported per page.
     """
     if use_oss_ocr is None:
         use_oss_ocr = open_source_ocr_enabled()
@@ -2067,7 +2079,7 @@ def extract_sections_for_pdf(
     if not sections and use_oss_ocr and ocr_errors:
         try:
             sections, chunk_note = extract_sections_via_chunked_subprocess(
-                pdf_bytes, use_oss_ocr=use_oss_ocr
+                pdf_bytes, use_oss_ocr=use_oss_ocr, on_page_done=on_page_done
             )
             if sections:
                 note = chunk_note or "Converted page by page."
@@ -2193,8 +2205,31 @@ async def process_job(job_id: str) -> dict[str, Any]:
 
             try:
                 pdf_bytes = download_storage_bytes(sb, bucket, path)
+
+                # OCR dominates the runtime, so the 35..80 band is reported
+                # per page group instead of jumping straight to 80. Without
+                # this the app would sit on a single percentage while the
+                # whole document is being scanned.
+                def _report_page_progress(
+                    group_index: int,
+                    total_groups: int,
+                    _index: int = index,
+                    _count: int = len(resolved_files),
+                ) -> None:
+                    try:
+                        share = (group_index + 1) / max(total_groups, 1)
+                        step = 45 / max(_count, 1)
+                        pct = 35 + int(_index * step + share * step)
+                        sb.table("ocr_jobs").update({"progress_pct": pct}).eq(
+                            "id", job_id
+                        ).execute()
+                    except Exception:
+                        pass
+
                 sections, note = extract_sections_for_pdf(
-                    pdf_bytes, use_oss_ocr=use_oss_ocr
+                    pdf_bytes,
+                    use_oss_ocr=use_oss_ocr,
+                    on_page_done=_report_page_progress,
                 )
 
                 has_local_text = has_local_text or bool(sections)

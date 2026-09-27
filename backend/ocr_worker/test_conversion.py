@@ -275,6 +275,20 @@ def main() -> int:
         "chunked path keeps the text of each page",
     )
 
+    progress_calls: list[tuple[int, int]] = []
+    progressed_sections, _ = worker.extract_sections_via_chunked_subprocess(
+        multi_pdf,
+        on_page_done=lambda group, total: progress_calls.append((group, total)),
+    )
+    check(
+        len(progress_calls) == 5,
+        "chunked path reports progress once per page",
+    )
+    check(
+        [int(index) for index, _ in progressed_sections] == [1, 2, 3, 4, 5],
+        "progress reporting does not disturb the reassembled pages",
+    )
+
     # --- background job runner -----------------------------------------
     check(worker.background_process_spawned(), "background jobs are enabled")
 
