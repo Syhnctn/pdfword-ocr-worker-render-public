@@ -2080,6 +2080,70 @@ def extract_sections_for_pdf(
     return sections, note
 
 
+def report_background_job_failure(job_id: str, exc: BaseException) -> None:
+    """Mark a job as failed after the background runner itself errored.
+
+    ``process_job`` already records its own failures, so this only covers the
+    case where the runner could not start or crashed outside of that handler.
+    """
+    try:
+        sb = make_supabase_client()
+        sb.table("ocr_jobs").update(
+            {
+                "status": "failed",
+                "progress_pct": 100,
+                "error_code": "ocr_error",
+                "error_message": str(exc)[:500],
+                "finished_at": utc_now(),
+            }
+        ).eq("id", job_id).execute()
+    except Exception:
+        # Nothing more can be done here; the job row stays inspectable.
+        pass
+
+
+def background_process_spawned() -> bool:
+    """Whether long jobs are handed to a detached process."""
+    return env_flag("OCR_BACKGROUND_JOBS", True)
+
+
+def _spawn_background_process(job_id: str) -> bool:
+    """Start the detached runner for ``job_id``; False when it cannot start."""
+    if not background_process_spawned():
+        return False
+
+    args = [sys.executable, "-m", "ocr_job_worker", job_id]
+    try:
+        subprocess.Popen(
+            args,
+            cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,
+        )
+    except Exception as exc:
+        print(f"[background] spawn failed: {exc}")
+        return False
+
+    print(f"[background] started for job {job_id}")
+    return True
+
+
+def process_job_safely(job_id: str) -> dict[str, Any]:
+    """Hand ``job_id`` to a detached runner and return immediately.
+
+    The platform closes idle connections after roughly a minute, which a
+    multi-page scan outlasts, so the work continues out of band while the
+    client polls ``get_job_status``.
+    """
+    if not _spawn_background_process(job_id):
+        return {"job_id": job_id, "status": "failed", "error": "spawn_failed"}
+
+    return {"job_id": job_id, "status": "processing", "mode": "background"}
+
+
 async def process_job(job_id: str) -> dict[str, Any]:
     sb = make_supabase_client()
     row_res = (
@@ -2213,12 +2277,16 @@ class ProcessRequest(BaseModel):
 @app.post("/internal/process")
 async def process(request: Request, payload: ProcessRequest) -> dict[str, Any]:
     assert_worker_secret(request)
+    if background_process_spawned():
+        return process_job_safely(payload.job_id)
     return await process_job(payload.job_id)
 
 
 @app.post("/internal/process/{job_id}")
 async def process_with_path(job_id: str, request: Request) -> dict[str, Any]:
     assert_worker_secret(request)
+    if background_process_spawned():
+        return process_job_safely(job_id)
     return await process_job(job_id)
 
 

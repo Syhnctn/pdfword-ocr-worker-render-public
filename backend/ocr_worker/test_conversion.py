@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import pathlib
 import sys
 import tempfile
+import time
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -271,6 +273,39 @@ def main() -> int:
     check(
         all("Sayfa" in text for _, text in merged_sections),
         "chunked path keeps the text of each page",
+    )
+
+    # --- background job runner -----------------------------------------
+    check(worker.background_process_spawned(), "background jobs are enabled")
+
+    original_background = os.environ.get("OCR_BACKGROUND_JOBS")
+    try:
+        os.environ["OCR_BACKGROUND_JOBS"] = "false"
+        check(
+            not worker.background_process_spawned(),
+            "OCR_BACKGROUND_JOBS=false switches back to inline processing",
+        )
+    finally:
+        if original_background is None:
+            os.environ.pop("OCR_BACKGROUND_JOBS", None)
+        else:
+            os.environ["OCR_BACKGROUND_JOBS"] = original_background
+
+    os.environ["OCR_BACKGROUND_JOBS"] = "true"
+    started = time.monotonic()
+    dispatched = worker.process_job_safely("background-test-job")
+    elapsed = time.monotonic() - started
+    check(
+        dispatched.get("status") == "processing",
+        "background dispatch reports the job as processing",
+    )
+    check(
+        dispatched.get("mode") == "background",
+        "background dispatch marks the response as background mode",
+    )
+    check(
+        elapsed < 5.0,
+        "background dispatch returns immediately without waiting for OCR",
     )
 
     print("ALL CONVERSION CHECKS PASSED")

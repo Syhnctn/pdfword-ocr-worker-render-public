@@ -25,7 +25,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py ocr_chunk_worker.py ./
+COPY main.py ocr_chunk_worker.py ocr_job_worker.py ./
 
 EXPOSE 8080
 
